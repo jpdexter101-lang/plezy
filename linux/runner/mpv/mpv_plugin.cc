@@ -4,9 +4,11 @@
 #include <new>
 
 #include "mpv_texture.h"
+#include "wayland_video_surface.h"
 
 enum class VideoBootstrapState { kIdle, kPending, kReady, kFailed };
 using PlayerPtr = std::unique_ptr<mpv::MpvPlayer>;
+using VideoSurfacePtr = std::unique_ptr<mpv::WaylandVideoSurface>;
 
 struct _MpvPlugin {
   GObject parent_instance;
@@ -18,6 +20,10 @@ struct _MpvPlugin {
 
   PlayerPtr player;
   MpvTexture* texture;  // owned via GObject ref
+  // Non-null when video goes to a native Wayland plane below the Flutter
+  // surface instead of through a Flutter texture. Mutually exclusive with
+  // |texture|; see mpv_plugin_start_video().
+  VideoSurfacePtr video_surface;
   gboolean texture_registered;
   gboolean visible;
   gboolean initialized;
@@ -82,8 +88,62 @@ static void release_video_resources(MpvPlugin* self) {
     self->player->Dispose();
     self->player.reset();
   }
+  // After the player is gone: disposal hands the render context to the
+  // process-lifetime teardown queue, which releases it surfacelessly, so the
+  // plane's EGL surface does not have to outlive it.
+  if (self->video_surface) {
+    self->video_surface->Destroy();
+    self->video_surface.reset();
+  }
   self->initialized = FALSE;
   self->visible = FALSE;
+}
+
+// Renders and presents one frame on the native video plane. Skipped while the
+// plane is hidden or has not been given a rect yet; both of those paths render
+// explicitly once the condition clears, because mpv's redraw latch stays set
+// until a render consumes it and would otherwise suppress every later frame.
+static void render_video_plane(MpvPlugin* self) {
+  if (!self->player || !self->video_surface || !self->video_surface->valid()) return;
+  if (!self->video_surface->visible() || !self->video_surface->has_size()) return;
+  if (self->player->RenderToSurface(
+          self->video_surface->egl_surface(), self->video_surface->width(),
+          self->video_surface->height())) {
+    self->video_surface->Present();
+  }
+}
+
+// Attempts the native Wayland video plane. Returns false when it is
+// unavailable for any reason (X11, no wl_subcompositor, no usable EGL config),
+// in which case the caller falls back to the Flutter texture path.
+static gboolean try_start_video_plane(MpvPlugin* self, FlView* view) {
+  if (view == nullptr) return FALSE;
+  // Escape hatch for driver or compositor trouble in the field, and the A/B
+  // switch for measuring the plane against the texture path.
+  if (g_strcmp0(g_getenv("PLEZY_DISABLE_VIDEO_PLANE"), "1") == 0) {
+    g_message("MPV: native video plane disabled by PLEZY_DISABLE_VIDEO_PLANE");
+    return FALSE;
+  }
+  GtkWidget* widget = GTK_WIDGET(view);
+  if (!mpv::WaylandVideoSurface::IsSupported(gtk_widget_get_display(widget))) return FALSE;
+
+  auto surface = std::make_unique<mpv::WaylandVideoSurface>();
+  std::string error;
+  // 8 bits per channel for now; HDR passthrough is what will ask for 10.
+  if (!surface->Create(widget, /*depth_bits=*/8, &error)) {
+    g_message("MPV: native video plane unavailable (%s); using the Flutter texture path", error.c_str());
+    return FALSE;
+  }
+  if (!self->player->InitRenderContextForSurface(
+          surface->egl_display(), surface->egl_config(), surface->egl_surface())) {
+    surface->Destroy();
+    g_message("MPV: video-plane render context failed; using the Flutter texture path");
+    return FALSE;
+  }
+
+  self->video_surface = std::move(surface);
+  self->player->SetRedrawCallback([self]() { render_video_plane(self); });
+  return TRUE;
 }
 
 struct TextureReadyContext {
@@ -260,6 +320,10 @@ static void mpv_plugin_handle_method_call(FlMethodChannel* channel, FlMethodCall
         response =
             FL_METHOD_RESPONSE(fl_method_error_response_new("INIT_FAILED", "Failed to initialize MPV player", nullptr));
       }
+    } else if (self->video_surface && self->video_surface->valid()) {
+      // Native video plane: a bool result tells the Dart side there is no
+      // texture, so the Video widget drives geometry via setVideoRect instead.
+      response = FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_bool(TRUE)));
     } else if (
         self->texture && (self->bootstrap_state == VideoBootstrapState::kPending ||
                           self->bootstrap_state == VideoBootstrapState::kReady)) {
@@ -277,6 +341,15 @@ static void mpv_plugin_handle_method_call(FlMethodChannel* channel, FlMethodCall
         self->bootstrap_state = VideoBootstrapState::kFailed;
         self->bootstrap_error = g_strdup("Failed to initialize MPV player");
         response = FL_METHOD_RESPONSE(fl_method_error_response_new("INIT_FAILED", self->bootstrap_error, nullptr));
+      } else if (try_start_video_plane(self, fl_plugin_registrar_get_view(self->registrar))) {
+        // Native Wayland plane: no Flutter texture, no GPU bootstrap handshake.
+        // Video composites below the Flutter surface, so presenting a video
+        // frame no longer forces Flutter to redraw the whole window.
+        ++self->generation;
+        self->bootstrap_state = VideoBootstrapState::kReady;
+        self->player->SetEventCallback([self](FlValue* event) { send_event(self, event); });
+        self->initialized = TRUE;
+        response = FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_bool(TRUE)));
       } else {
         FlView* view = fl_plugin_registrar_get_view(self->registrar);
         self->texture = mpv_texture_new(self->player.get(), self->texture_registrar, view);
@@ -458,12 +531,53 @@ static void mpv_plugin_handle_method_call(FlMethodChannel* channel, FlMethodCall
     } else {
       self->visible = fl_value_get_bool(visible_value);
 
-      if (self->visible && self->texture) {
+      if (self->video_surface) {
+        self->video_surface->SetVisible(self->visible);
+        // Becoming visible has to render explicitly: the redraw latch was
+        // consumed (or suppressed) while hidden, so no callback is pending.
+        if (self->visible) render_video_plane(self);
+      } else if (self->visible && self->texture) {
         // Trigger a frame render when becoming visible
         mpv_texture_mark_frame_available(self->texture);
       }
 
       response = FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
+    }
+  } else if (strcmp(method, "setVideoRect") == 0) {
+    if (!self->video_surface) {
+      // Texture mode places video through the Flutter widget tree instead.
+      response = FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
+    } else {
+      auto read_int = [args](const char* key, int64_t* out) {
+        FlValue* value = fl_value_lookup_string(args, key);
+        if (value == nullptr || fl_value_get_type(value) != FL_VALUE_TYPE_INT) return false;
+        *out = fl_value_get_int(value);
+        return true;
+      };
+      int64_t left = 0, top = 0, right = 0, bottom = 0;
+      if (!read_int("left", &left) || !read_int("top", &top) || !read_int("right", &right) ||
+          !read_int("bottom", &bottom)) {
+        response = FL_METHOD_RESPONSE(
+            fl_method_error_response_new("INVALID_ARGS", "Missing video rect bounds", nullptr));
+      } else {
+        FlValue* dpr_value = fl_value_lookup_string(args, "devicePixelRatio");
+        double dpr = 1.0;
+        if (dpr_value != nullptr && fl_value_get_type(dpr_value) == FL_VALUE_TYPE_FLOAT) {
+          dpr = fl_value_get_float(dpr_value);
+        }
+        // GTK3 only ever reports integer scale factors, and the rect already
+        // arrives in physical pixels, so the scale is purely how many buffer
+        // pixels make up one surface-local unit.
+        int32_t scale = static_cast<int32_t>(dpr + 0.5);
+        if (scale < 1) scale = 1;
+        self->video_surface->SetRect(
+            static_cast<int32_t>(left), static_cast<int32_t>(top), static_cast<int32_t>(right - left),
+            static_cast<int32_t>(bottom - top), scale);
+        // Re-render at the new size straight away; waiting for the next mpv
+        // frame would leave a stale buffer stretched across the new rect.
+        render_video_plane(self);
+        response = FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
+      }
     }
   } else if (strcmp(method, "updateFrame") == 0) {
     if (self->visible && self->texture) {

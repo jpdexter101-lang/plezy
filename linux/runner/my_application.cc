@@ -1,9 +1,38 @@
 #include "my_application.h"
 
 #include <flutter_linux/flutter_linux.h>
+#include <gdk/gdk.h>
+#ifdef GDK_WINDOWING_WAYLAND
+#include <gdk/gdkwayland.h>
+#endif
 
 #include "flutter/generated_plugin_registrant.h"
 #include "mpv/mpv_plugin.h"
+
+// On Wayland the mpv video plane is a wl_subsurface stacked *below* this
+// window's surface, so the window needs an alpha channel for it to show
+// through. Harmless when the plane is unavailable: the Flutter UI paints
+// opaque anyway, and X11 sessions keep the Flutter texture path.
+static void enable_video_plane_transparency(GtkWindow* window, FlView* view) {
+#ifdef GDK_WINDOWING_WAYLAND
+  GdkDisplay* display = gtk_widget_get_display(GTK_WIDGET(window));
+  if (!GDK_IS_WAYLAND_DISPLAY(display)) return;
+
+  GdkScreen* screen = gtk_widget_get_screen(GTK_WIDGET(window));
+  GdkVisual* visual = gdk_screen_get_rgba_visual(screen);
+  if (visual == nullptr) return;
+
+  gtk_widget_set_visual(GTK_WIDGET(window), visual);
+  gtk_widget_set_app_paintable(GTK_WIDGET(window), TRUE);
+
+  // fl_view skips painting entirely when the background is fully transparent.
+  GdkRGBA transparent = {0.0, 0.0, 0.0, 0.0};
+  fl_view_set_background_color(view, &transparent);
+#else
+  (void)window;
+  (void)view;
+#endif
+}
 
 struct _MyApplication {
   GtkApplication parent_instance;
@@ -36,11 +65,13 @@ static void my_application_activate(GApplication* application) {
 
   gtk_window_set_default_size(window, 1280, 720);
 
-  // Create the Flutter view (opaque — no overlay needed).
+  // Create the Flutter view. On Wayland it composites over the native mpv
+  // video plane, so it must be able to carry alpha.
   g_autoptr(FlDartProject) project = fl_dart_project_new();
   fl_dart_project_set_dart_entrypoint_arguments(project, self->dart_entrypoint_arguments);
 
   self->flutter_view = fl_view_new(project);
+  enable_video_plane_transparency(window, self->flutter_view);
   gtk_widget_show(GTK_WIDGET(self->flutter_view));
   gtk_container_add(GTK_CONTAINER(window), GTK_WIDGET(self->flutter_view));
 

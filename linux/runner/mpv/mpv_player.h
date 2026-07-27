@@ -93,6 +93,21 @@ class MpvPlayer {
   /// @return true if render context creation succeeded.
   bool InitRenderContext();
 
+  /// Creates the mpv render context bound to an app-owned EGL window surface —
+  /// the Wayland video plane — instead of Flutter's texture FBO.
+  ///
+  /// Unlike InitRenderContext(), nothing here is shared with or derived from
+  /// Flutter's GL state, so the context is free to be ES 3.x. The resulting
+  /// display/context pair is stored in the same fields the texture path uses,
+  /// so disposal and the process-lifetime teardown queue are unchanged.
+  /// @return true if render context creation succeeded.
+  bool InitRenderContextForSurface(EGLDisplay display, EGLConfig config, EGLSurface surface);
+
+  /// Renders one frame into |surface|'s default framebuffer. The caller
+  /// presents it (eglSwapBuffers) once this returns.
+  /// @return true if the frame was rendered.
+  bool RenderToSurface(EGLSurface surface, int width, int height);
+
   /// Returns true if the render context has been created.
   bool HasRenderContext() const;
 

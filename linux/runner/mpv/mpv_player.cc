@@ -527,6 +527,119 @@ bool MpvPlayer::InitRenderContext() {
   return true;
 }
 
+bool MpvPlayer::InitRenderContextForSurface(EGLDisplay display, EGLConfig config, EGLSurface surface) {
+  RetryPendingNativeTeardown();
+
+  std::lock_guard<std::mutex> lock(native_mutex_);
+  if (audio_only_ || disposed_) {
+    g_warning("MPV: Video-plane render context requested for an unavailable player");
+    return false;
+  }
+  if (mpv_gl_) return true;
+  if (!mpv_) {
+    g_warning("MPV: Cannot create render context - mpv not initialized");
+    return false;
+  }
+  if (display == EGL_NO_DISPLAY || surface == EGL_NO_SURFACE) {
+    g_warning("MPV: Video plane provided no usable EGL display or surface");
+    return false;
+  }
+  if (!retained_render_contexts_.empty()) {
+    g_warning("MPV: Retained render context still requires a later EGL teardown retry");
+    return false;
+  }
+
+  if (!eglBindAPI(EGL_OPENGL_ES_API)) {
+    g_warning("MPV: Failed to bind OpenGL ES API: 0x%x", eglGetError());
+    return false;
+  }
+
+  // Nothing is shared with Flutter here, so prefer an ES 3 context: mpv needs
+  // it for compute shaders (hdr-compute-peak) and for >8-bit render targets.
+  EGLContext candidate_context = EGL_NO_CONTEXT;
+  for (const EGLint client_version : {3, 2}) {
+    const EGLint context_attribs[] = {EGL_CONTEXT_CLIENT_VERSION, client_version, EGL_NONE};
+    candidate_context = eglCreateContext(display, config, EGL_NO_CONTEXT, context_attribs);
+    if (candidate_context != EGL_NO_CONTEXT) break;
+  }
+  if (candidate_context == EGL_NO_CONTEXT) {
+    g_warning("MPV: Failed to create the video-plane EGL context: 0x%x", eglGetError());
+    return false;
+  }
+
+  auto destroy_candidate_context = [&]() {
+    if (eglGetCurrentContext() == candidate_context) {
+      eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    }
+    if (!eglDestroyContext(display, candidate_context)) {
+      g_warning("MPV: Failed to destroy rejected video-plane EGL context: 0x%x", eglGetError());
+    }
+  };
+
+  if (!eglMakeCurrent(display, surface, surface, candidate_context)) {
+    g_warning("MPV: Failed to activate the video-plane EGL context: 0x%x", eglGetError());
+    destroy_candidate_context();
+    return false;
+  }
+
+  mpv_opengl_init_params gl_init_params{};
+  gl_init_params.get_proc_address = get_opengl_proc_address;
+  gl_init_params.get_proc_address_ctx = nullptr;
+  mpv_render_param params[] = {
+      {MPV_RENDER_PARAM_API_TYPE, const_cast<char*>(MPV_RENDER_API_TYPE_OPENGL)},
+      {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, &gl_init_params},
+      {MPV_RENDER_PARAM_INVALID, nullptr},
+  };
+
+  mpv_render_context* candidate_gl = nullptr;
+  const int error = mpv_render_context_create(&candidate_gl, mpv_, params);
+  if (error < 0 || candidate_gl == nullptr) {
+    g_warning("MPV: mpv_render_context_create() failed for the video plane: %s", mpv_error_string(error));
+    if (candidate_gl) mpv_render_context_free(candidate_gl);
+    destroy_candidate_context();
+    return false;
+  }
+
+  egl_display_ = display;
+  egl_context_ = candidate_context;
+  mpv_gl_ = candidate_gl;
+  mpv_render_context_set_update_callback(mpv_gl_, OnMpvRenderUpdate, callback_context_.get());
+  g_message("MPV: Render context created on the Wayland video plane");
+  return true;
+}
+
+bool MpvPlayer::RenderToSurface(EGLSurface surface, int width, int height) {
+  std::lock_guard<std::mutex> lock(native_mutex_);
+  if (disposed_ || !mpv_gl_ || egl_context_ == EGL_NO_CONTEXT || surface == EGL_NO_SURFACE) return false;
+  if (width < 1 || height < 1) return false;
+
+  if (!eglBindAPI(EGL_OPENGL_ES_API) || !eglMakeCurrent(egl_display_, surface, surface, egl_context_)) {
+    g_warning("MPV: Failed to activate the video-plane EGL context for render: 0x%x", eglGetError());
+    return false;
+  }
+
+  // Consume the redraw latch before rendering, exactly as the texture path
+  // does: OnMpvRenderUpdate drops further notifications until it is cleared.
+  needs_redraw_.store(false);
+
+  mpv_opengl_fbo mpv_fbo{};
+  mpv_fbo.fbo = 0;  // the window surface's default framebuffer
+  mpv_fbo.w = width;
+  mpv_fbo.h = height;
+  mpv_fbo.internal_format = 0;
+
+  // The default framebuffer is bottom-up relative to mpv's image orientation,
+  // unlike the texture path's own FBO, so this one flips.
+  int flip_y = 1;
+  mpv_render_param params[] = {
+      {MPV_RENDER_PARAM_OPENGL_FBO, &mpv_fbo},
+      {MPV_RENDER_PARAM_FLIP_Y, &flip_y},
+      {MPV_RENDER_PARAM_INVALID, nullptr},
+  };
+  mpv_render_context_render(mpv_gl_, params);
+  return true;
+}
+
 void MpvPlayer::Dispose() {
   if (disposed_.exchange(true)) {
     return;

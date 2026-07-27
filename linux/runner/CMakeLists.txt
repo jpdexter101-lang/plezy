@@ -13,6 +13,7 @@ add_executable(${BINARY_NAME}
   "mpv/mpv_gpu_bootstrap.cc"
   "mpv/mpv_plugin.cc"
   "mpv/mpv_texture.cc"
+  "mpv/wayland_video_surface.cc"
   "${FLUTTER_MANAGED_DIR}/generated_plugin_registrant.cc"
 )
 
@@ -29,6 +30,13 @@ pkg_check_modules(MPV REQUIRED IMPORTED_TARGET mpv)
 # Find epoxy (OpenGL loader).
 pkg_check_modules(EPOXY REQUIRED IMPORTED_TARGET epoxy)
 
+# Wayland client + EGL back the native video plane (a wl_subsurface below the
+# Flutter surface). GTK's Wayland backend already links these, but the runner
+# calls them directly, so depend on them explicitly.
+pkg_check_modules(WAYLAND_CLIENT REQUIRED IMPORTED_TARGET wayland-client)
+pkg_check_modules(WAYLAND_EGL REQUIRED IMPORTED_TARGET wayland-egl)
+pkg_check_modules(EGL REQUIRED IMPORTED_TARGET egl)
+
 # Build simdutf as a static library from the single-header amalgamation.
 add_library(simdutf STATIC "${simdutf_SOURCE_DIR}/simdutf.cpp")
 target_include_directories(simdutf PUBLIC "${simdutf_SOURCE_DIR}")
@@ -41,6 +49,9 @@ target_link_libraries(${BINARY_NAME} PRIVATE flutter)
 target_link_libraries(${BINARY_NAME} PRIVATE PkgConfig::GTK)
 target_link_libraries(${BINARY_NAME} PRIVATE PkgConfig::MPV)
 target_link_libraries(${BINARY_NAME} PRIVATE PkgConfig::EPOXY)
+target_link_libraries(${BINARY_NAME} PRIVATE PkgConfig::WAYLAND_CLIENT)
+target_link_libraries(${BINARY_NAME} PRIVATE PkgConfig::WAYLAND_EGL)
+target_link_libraries(${BINARY_NAME} PRIVATE PkgConfig::EGL)
 target_link_libraries(${BINARY_NAME} PRIVATE simdutf)
 
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
