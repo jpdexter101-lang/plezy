@@ -166,8 +166,39 @@ bool WaylandVideoSurface::Create(GtkWidget* view, int depth_bits, std::string* e
     return Fail(error, "Failed to create the video EGL surface");
   }
 
+  // eglSwapBuffers runs on the GTK main thread, so it must never block. At the
+  // default swap interval Mesa throttles the swap on the compositor's frame
+  // callback, and an occluded or minimized surface stops being acknowledged —
+  // which hangs the whole platform thread. Pacing is done explicitly below.
+  if (!eglSwapInterval(egl_display_, 0)) {
+    g_warning("MPV video plane: could not disable EGL swap throttling: 0x%x", eglGetError());
+  }
+
   RequestParentCommit();
   return true;
+}
+
+void WaylandVideoSurface::ClearFrameCallback() {
+  if (frame_callback_ != nullptr) {
+    wl_callback_destroy(frame_callback_);
+    frame_callback_ = nullptr;
+  }
+  frame_pending_ = false;
+}
+
+void WaylandVideoSurface::HandleFrameDone(void* data, wl_callback* callback, uint32_t time) {
+  (void)time;
+  auto* self = static_cast<WaylandVideoSurface*>(data);
+  if (self->frame_callback_ == callback) {
+    wl_callback_destroy(self->frame_callback_);
+    self->frame_callback_ = nullptr;
+  } else if (callback != nullptr) {
+    wl_callback_destroy(callback);
+  }
+  self->frame_pending_ = false;
+  // Rendering resumes from here, not from mpv: its redraw latch is still set
+  // from the update we declined to serve, so it will not notify again.
+  if (self->on_frame_) self->on_frame_();
 }
 
 void WaylandVideoSurface::Destroy() {
@@ -182,6 +213,8 @@ void WaylandVideoSurface::Destroy() {
     wl_egl_window_destroy(egl_window_);
     egl_window_ = nullptr;
   }
+  ClearFrameCallback();
+  on_frame_ = nullptr;
   if (subsurface_ != nullptr) {
     wl_subsurface_destroy(subsurface_);
     subsurface_ = nullptr;
@@ -242,6 +275,7 @@ void WaylandVideoSurface::SetVisible(bool visible) {
   visible_ = visible;
   if (surface_ == nullptr) return;
   if (!visible) {
+    ClearFrameCallback();
     wl_surface_attach(surface_, nullptr, 0, 0);
     wl_surface_commit(surface_);
     buffer_attached_ = false;
@@ -251,8 +285,19 @@ void WaylandVideoSurface::SetVisible(bool visible) {
 }
 
 bool WaylandVideoSurface::Present() {
-  if (!visible_ || egl_surface_ == EGL_NO_SURFACE) return false;
+  if (!visible_ || egl_surface_ == EGL_NO_SURFACE || frame_pending_) return false;
+
+  // Ask for the acknowledgement before the commit that eglSwapBuffers performs,
+  // so the callback belongs to this frame.
+  static const wl_callback_listener kFrameListener = {HandleFrameDone};
+  frame_callback_ = wl_surface_frame(surface_);
+  if (frame_callback_ != nullptr) {
+    wl_callback_add_listener(frame_callback_, &kFrameListener, this);
+    frame_pending_ = true;
+  }
+
   if (eglSwapBuffers(egl_display_, egl_surface_) != EGL_TRUE) {
+    ClearFrameCallback();
     g_warning("MPV video plane: eglSwapBuffers failed: 0x%x", eglGetError());
     return false;
   }

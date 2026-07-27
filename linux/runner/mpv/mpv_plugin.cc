@@ -106,6 +106,10 @@ static void release_video_resources(MpvPlugin* self) {
 static void render_video_plane(MpvPlugin* self) {
   if (!self->player || !self->video_surface || !self->video_surface->valid()) return;
   if (!self->video_surface->visible() || !self->video_surface->has_size()) return;
+  // Skip entirely while the compositor has not acknowledged the last frame:
+  // an occluded plane is never acknowledged, and rendering into it anyway
+  // would burn GPU work on frames that can never be shown.
+  if (self->video_surface->frame_pending()) return;
   if (self->player->RenderToSurface(
           self->video_surface->egl_surface(), self->video_surface->width(),
           self->video_surface->height())) {
@@ -142,6 +146,7 @@ static gboolean try_start_video_plane(MpvPlugin* self, FlView* view) {
   }
 
   self->video_surface = std::move(surface);
+  self->video_surface->SetFrameCallback([self]() { render_video_plane(self); });
   self->player->SetRedrawCallback([self]() { render_video_plane(self); });
   return TRUE;
 }

@@ -5,8 +5,10 @@
 #include <gtk/gtk.h>
 
 #include <cstdint>
+#include <functional>
 #include <string>
 
+struct wl_callback;
 struct wl_compositor;
 struct wl_display;
 struct wl_egl_window;
@@ -76,13 +78,29 @@ class WaylandVideoSurface {
   void SetVisible(bool visible);
   bool visible() const { return visible_; }
 
-  // Presents whatever was rendered into the EGL surface.
+  // True while a committed frame has not yet been acknowledged by the
+  // compositor. Callers must not render while this holds: the compositor stops
+  // acknowledging frames for an occluded or minimized surface, and rendering
+  // regardless would queue work that can never drain.
+  bool frame_pending() const { return frame_pending_; }
+
+  // Invoked on the GTK main thread when the compositor acknowledges a frame.
+  // This is what resumes rendering after the plane becomes visible again, so
+  // it must trigger a render — mpv's redraw latch stays set while frames are
+  // being skipped and will not notify again on its own.
+  void SetFrameCallback(std::function<void()> callback) { on_frame_ = std::move(callback); }
+
+  // Presents whatever was rendered into the EGL surface. No-op while hidden or
+  // while a frame is still pending.
   bool Present();
 
  private:
   bool BindGlobals(GdkDisplay* display, std::string* error);
   bool InitEgl(int depth_bits, std::string* error);
   void RequestParentCommit();
+  void ClearFrameCallback();
+
+  static void HandleFrameDone(void* data, wl_callback* callback, uint32_t time);
 
   GtkWidget* view_ = nullptr;
 
@@ -104,6 +122,9 @@ class WaylandVideoSurface {
   int32_t scale_ = 1;
   bool visible_ = false;
   bool buffer_attached_ = false;
+  bool frame_pending_ = false;
+  wl_callback* frame_callback_ = nullptr;
+  std::function<void()> on_frame_;
 };
 
 }  // namespace mpv
