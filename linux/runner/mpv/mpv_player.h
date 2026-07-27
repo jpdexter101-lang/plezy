@@ -147,6 +147,14 @@ class MpvPlayer {
   /// Sets an mpv property asynchronously.
   void SetPropertyAsync(const std::string& name, const std::string& value, StatusCallback callback);
 
+  /// Switches mpv's output colour space between PQ / BT.2020 passthrough and
+  /// its normal tone-mapped SDR output.
+  ///
+  /// `target-colorspace-hint` is deliberately not used: it is declared by
+  /// vo_gpu_next only, so the render API — which runs the legacy gpu renderer —
+  /// ignores it entirely. target-trc/target-prim are what that renderer reads.
+  void SetHdrOutput(bool enabled, StatusCallback callback);
+
   /// Gets an mpv property value asynchronously.
   void GetPropertyAsync(const std::string& name, GetPropertyCallback callback);
 

@@ -128,6 +128,14 @@ class _HarnessAppState extends State<_HarnessApp> {
         await player.setLogLevel(level);
         stdout.writeln('HARNESS_MPV_LOG $level');
       }
+      if (Platform.environment['PLEZY_HARNESS_HDR'] == '1') {
+        try {
+          await player.setProperty('hdr-enabled', 'yes');
+          stdout.writeln('HARNESS_HDR requested');
+        } catch (e) {
+          stdout.writeln('HARNESS_HDR_ERROR $e');
+        }
+      }
       await player.open(Media(uri));
       stdout.writeln('HARNESS_OPENED $uri');
       final id = player is PlayerBase ? player.textureId : null;

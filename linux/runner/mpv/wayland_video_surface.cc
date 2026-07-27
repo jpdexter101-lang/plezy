@@ -4,16 +4,56 @@
 #include <wayland-client.h>
 #include <wayland-egl.h>
 
+#include "color-management-v1-client-protocol.h"
+
 namespace mpv {
 namespace {
+
+// The client understands up to this version of color-management-v1; KWin 6.4
+// implements 1. Binding min(advertised, this) keeps newer compositors working
+// without requiring them.
+constexpr uint32_t kColorManagerMaxVersion = 3;
 
 bool Fail(std::string* error, const char* message) {
   if (error) *error = message;
   return false;
 }
 
+// What the compositor answered while its globals were being bound.
 struct RegistryTarget {
   wl_subcompositor* subcompositor = nullptr;
+  wp_color_manager_v1* color_manager = nullptr;
+  bool parametric = false;
+  bool pq = false;
+  bool bt2020 = false;
+  bool done = false;
+};
+
+void ManagerIntent(void* data, wp_color_manager_v1* manager, uint32_t intent) {
+  (void)data; (void)manager; (void)intent;
+}
+void ManagerFeature(void* data, wp_color_manager_v1* manager, uint32_t feature) {
+  (void)manager;
+  auto* target = static_cast<RegistryTarget*>(data);
+  if (feature == WP_COLOR_MANAGER_V1_FEATURE_PARAMETRIC) target->parametric = true;
+}
+void ManagerTransferFunction(void* data, wp_color_manager_v1* manager, uint32_t tf) {
+  (void)manager;
+  auto* target = static_cast<RegistryTarget*>(data);
+  if (tf == WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ) target->pq = true;
+}
+void ManagerPrimaries(void* data, wp_color_manager_v1* manager, uint32_t primaries) {
+  (void)manager;
+  auto* target = static_cast<RegistryTarget*>(data);
+  if (primaries == WP_COLOR_MANAGER_V1_PRIMARIES_BT2020) target->bt2020 = true;
+}
+void ManagerDone(void* data, wp_color_manager_v1* manager) {
+  (void)manager;
+  static_cast<RegistryTarget*>(data)->done = true;
+}
+
+const wp_color_manager_v1_listener kManagerListener = {
+    ManagerIntent, ManagerFeature, ManagerTransferFunction, ManagerPrimaries, ManagerDone,
 };
 
 void RegistryGlobal(void* data, wl_registry* registry, uint32_t name, const char* interface, uint32_t version) {
@@ -21,8 +61,11 @@ void RegistryGlobal(void* data, wl_registry* registry, uint32_t name, const char
   if (g_strcmp0(interface, "wl_subcompositor") == 0 && target->subcompositor == nullptr) {
     target->subcompositor =
         static_cast<wl_subcompositor*>(wl_registry_bind(registry, name, &wl_subcompositor_interface, 1));
+  } else if (g_strcmp0(interface, "wp_color_manager_v1") == 0 && target->color_manager == nullptr) {
+    const uint32_t bind_version = version < kColorManagerMaxVersion ? version : kColorManagerMaxVersion;
+    target->color_manager = static_cast<wp_color_manager_v1*>(
+        wl_registry_bind(registry, name, &wp_color_manager_v1_interface, bind_version));
   }
-  (void)version;
 }
 
 void RegistryGlobalRemove(void* data, wl_registry* registry, uint32_t name) {
@@ -71,7 +114,19 @@ bool WaylandVideoSurface::BindGlobals(GdkDisplay* display, std::string* error) {
 
   RegistryTarget target;
   wl_registry_add_listener(registry, &kRegistryListener, &target);
-  const bool round_tripped = wl_display_roundtrip_queue(wl_display_, queue) >= 0;
+  bool round_tripped = wl_display_roundtrip_queue(wl_display_, queue) >= 0;
+
+  // The colour manager reports what it supports right after binding, so a
+  // second roundtrip is needed before those answers can be trusted.
+  if (round_tripped && target.color_manager != nullptr) {
+    wp_color_manager_v1_add_listener(target.color_manager, &kManagerListener, &target);
+    for (int attempt = 0; attempt < 4 && !target.done; ++attempt) {
+      if (wl_display_roundtrip_queue(wl_display_, queue) < 0) {
+        round_tripped = false;
+        break;
+      }
+    }
+  }
 
   wl_registry_destroy(registry);
   wl_event_queue_destroy(queue);
@@ -81,10 +136,24 @@ bool WaylandVideoSurface::BindGlobals(GdkDisplay* display, std::string* error) {
 
   wl_proxy_set_queue(reinterpret_cast<wl_proxy*>(target.subcompositor), nullptr);
   subcompositor_ = target.subcompositor;
+
+  if (target.color_manager != nullptr) {
+    wl_proxy_set_queue(reinterpret_cast<wl_proxy*>(target.color_manager), nullptr);
+    color_manager_ = target.color_manager;
+    // All three are required to describe a plane as HDR10. Anything less and
+    // the plane simply stays sRGB and mpv keeps tone-mapping as it does today.
+    supports_hdr_ = target.done && target.parametric && target.pq && target.bt2020;
+    if (!supports_hdr_) {
+      g_message(
+          "MPV video plane: compositor colour management is incomplete "
+          "(parametric=%d pq=%d bt2020=%d); HDR passthrough unavailable",
+          target.parametric, target.pq, target.bt2020);
+    }
+  }
   return true;
 }
 
-bool WaylandVideoSurface::InitEgl(int depth_bits, std::string* error) {
+bool WaylandVideoSurface::InitEgl(std::string* error) {
   // The plane's EGL stack is deliberately independent of Flutter's: nothing is
   // shared, so the context is free to be ES 3.x (mpv wants compute shaders for
   // hdr-compute-peak, and >8-bit render targets for HDR later).
@@ -97,24 +166,30 @@ bool WaylandVideoSurface::InitEgl(int depth_bits, std::string* error) {
 
   // Video is opaque, so no alpha channel is requested: the compositor can then
   // treat the plane as opaque and may promote it to a hardware plane.
-  for (const EGLint renderable : {EGL_OPENGL_ES3_BIT, EGL_OPENGL_ES2_BIT}) {
-    const EGLint attributes[] = {
-        EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, renderable,
-        EGL_RED_SIZE,     depth_bits,     EGL_GREEN_SIZE,      depth_bits,
-        EGL_BLUE_SIZE,    depth_bits,     EGL_ALPHA_SIZE,      0,
-        EGL_NONE,
-    };
-    EGLConfig config = nullptr;
-    EGLint count = 0;
-    if (eglChooseConfig(egl_display_, attributes, &config, 1, &count) && count == 1) {
-      egl_config_ = config;
-      return true;
+  //
+  // 10 bits first, because PQ quantised to 8 bits bands visibly; 8 is the
+  // fallback and simply means HDR stays off.
+  for (const int depth : {10, 8}) {
+    for (const EGLint renderable : {EGL_OPENGL_ES3_BIT, EGL_OPENGL_ES2_BIT}) {
+      const EGLint attributes[] = {
+          EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, renderable,
+          EGL_RED_SIZE,     depth,          EGL_GREEN_SIZE,      depth,
+          EGL_BLUE_SIZE,    depth,          EGL_ALPHA_SIZE,      0,
+          EGL_NONE,
+      };
+      EGLConfig config = nullptr;
+      EGLint count = 0;
+      if (eglChooseConfig(egl_display_, attributes, &config, 1, &count) && count == 1) {
+        egl_config_ = config;
+        depth_bits_ = depth;
+        return true;
+      }
     }
   }
   return Fail(error, "No matching EGL config for the video plane");
 }
 
-bool WaylandVideoSurface::Create(GtkWidget* view, int depth_bits, std::string* error) {
+bool WaylandVideoSurface::Create(GtkWidget* view, std::string* error) {
   if (view == nullptr) return Fail(error, "Video plane requires a realized view");
   GdkDisplay* display = gtk_widget_get_display(view);
   if (!IsSupported(display)) return Fail(error, "Not a Wayland display");
@@ -123,7 +198,7 @@ bool WaylandVideoSurface::Create(GtkWidget* view, int depth_bits, std::string* e
   if (parent == nullptr) return Fail(error, "Toplevel has no Wayland surface yet");
 
   view_ = view;
-  if (!BindGlobals(display, error) || !InitEgl(depth_bits, error)) {
+  if (!BindGlobals(display, error) || !InitEgl(error)) {
     Destroy();
     return false;
   }
@@ -166,16 +241,114 @@ bool WaylandVideoSurface::Create(GtkWidget* view, int depth_bits, std::string* e
     return Fail(error, "Failed to create the video EGL surface");
   }
 
-  // eglSwapBuffers runs on the GTK main thread, so it must never block. At the
-  // default swap interval Mesa throttles the swap on the compositor's frame
-  // callback, and an occluded or minimized surface stops being acknowledged —
-  // which hangs the whole platform thread. Pacing is done explicitly below.
-  if (!eglSwapInterval(egl_display_, 0)) {
-    g_warning("MPV video plane: could not disable EGL swap throttling: 0x%x", eglGetError());
+  // Note: the swap interval cannot be set here — eglSwapInterval acts on the
+  // surface bound to the *current* context, and none is current yet. It is set
+  // in MpvPlayer::InitRenderContextForSurface once the context is bound.
+
+  if (color_manager_ != nullptr) {
+    color_surface_ = wp_color_manager_v1_get_surface(color_manager_, surface_);
   }
+  // PQ in 8 bits bands badly enough to be worse than tone-mapping to SDR, so
+  // HDR is only offered when the plane actually got a 10-bit config.
+  if (supports_hdr_ && (color_surface_ == nullptr || depth_bits_ < 10)) {
+    supports_hdr_ = false;
+    g_message("MPV video plane: HDR unavailable (colour surface=%p, depth=%d bits)",
+              static_cast<void*>(color_surface_), depth_bits_);
+  }
+  g_message("MPV video plane: %d bits per channel, HDR %s", depth_bits_,
+            supports_hdr_ ? "available" : "unavailable");
 
   RequestParentCommit();
   return true;
+}
+
+void WaylandVideoSurface::ClearImageDescription() {
+  if (image_description_ != nullptr) {
+    wp_image_description_v1_destroy(image_description_);
+    image_description_ = nullptr;
+  }
+}
+
+void WaylandVideoSurface::HandleImageDescriptionReady(
+    void* data, wp_image_description_v1* desc, uint32_t identity) {
+  (void)identity;
+  auto* self = static_cast<WaylandVideoSurface*>(data);
+  if (self->image_description_ != desc || self->color_surface_ == nullptr) return;
+  if (!self->hdr_requested_) return;
+
+  wp_color_management_surface_v1_set_image_description(
+      self->color_surface_, desc, WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL);
+  self->hdr_active_ = true;
+  g_message("MPV video plane: PQ / BT.2020 image description attached");
+  // Surface state is double-buffered; it lands on the next commit.
+  self->RequestParentCommit();
+}
+
+void WaylandVideoSurface::HandleImageDescriptionFailed(
+    void* data, wp_image_description_v1* desc, uint32_t cause, const char* message) {
+  (void)desc;
+  auto* self = static_cast<WaylandVideoSurface*>(data);
+  self->hdr_active_ = false;
+  g_warning("MPV video plane: compositor rejected the HDR image description (cause %u): %s", cause,
+            message ? message : "no reason given");
+  self->ClearImageDescription();
+}
+
+void WaylandVideoSurface::SetHdr(bool enabled, const HdrMetadata& metadata) {
+  if (!supports_hdr_ || color_surface_ == nullptr) return;
+  if (enabled == hdr_requested_ && (!enabled || image_description_ != nullptr)) return;
+
+  hdr_requested_ = enabled;
+  ClearImageDescription();
+
+  if (!enabled) {
+    if (hdr_active_) {
+      wp_color_management_surface_v1_unset_image_description(color_surface_);
+      hdr_active_ = false;
+      RequestParentCommit();
+    }
+    return;
+  }
+
+  wp_image_description_creator_params_v1* creator =
+      wp_color_manager_v1_create_parametric_creator(color_manager_);
+  if (creator == nullptr) {
+    g_warning("MPV video plane: compositor refused a parametric image-description creator");
+    hdr_requested_ = false;
+    return;
+  }
+
+  wp_image_description_creator_params_v1_set_tf_named(
+      creator, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ);
+  wp_image_description_creator_params_v1_set_primaries_named(
+      creator, WP_COLOR_MANAGER_V1_PRIMARIES_BT2020);
+
+  // Only forward metadata the source actually carried. Inventing values here
+  // would have the compositor tone-map against a mastering display that never
+  // existed, which is worse than letting it apply its own default.
+  if (metadata.max_luminance > 0) {
+    wp_image_description_creator_params_v1_set_mastering_luminance(
+        creator, static_cast<uint32_t>(metadata.min_luminance * 10000.0), metadata.max_luminance);
+  }
+  if (metadata.max_cll > 0) {
+    wp_image_description_creator_params_v1_set_max_cll(creator, metadata.max_cll);
+  }
+  if (metadata.max_fall > 0) {
+    wp_image_description_creator_params_v1_set_max_fall(creator, metadata.max_fall);
+  }
+
+  // create() consumes the creator, so it must not be destroyed afterwards.
+  static const wp_image_description_v1_listener kDescriptionListener = {
+      HandleImageDescriptionFailed,
+      HandleImageDescriptionReady,
+  };
+  image_description_ = wp_image_description_creator_params_v1_create(creator);
+  if (image_description_ == nullptr) {
+    g_warning("MPV video plane: could not create the HDR image description");
+    hdr_requested_ = false;
+    return;
+  }
+  wp_image_description_v1_add_listener(image_description_, &kDescriptionListener, this);
 }
 
 void WaylandVideoSurface::ClearFrameCallback() {
@@ -215,6 +388,19 @@ void WaylandVideoSurface::Destroy() {
   }
   ClearFrameCallback();
   on_frame_ = nullptr;
+  ClearImageDescription();
+  if (color_surface_ != nullptr) {
+    wp_color_management_surface_v1_destroy(color_surface_);
+    color_surface_ = nullptr;
+  }
+  if (color_manager_ != nullptr) {
+    wp_color_manager_v1_destroy(color_manager_);
+    color_manager_ = nullptr;
+  }
+  supports_hdr_ = false;
+  hdr_requested_ = false;
+  hdr_active_ = false;
+  depth_bits_ = 8;
   if (subsurface_ != nullptr) {
     wl_subsurface_destroy(subsurface_);
     subsurface_ = nullptr;

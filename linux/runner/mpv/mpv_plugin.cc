@@ -133,8 +133,7 @@ static gboolean try_start_video_plane(MpvPlugin* self, FlView* view) {
 
   auto surface = std::make_unique<mpv::WaylandVideoSurface>();
   std::string error;
-  // 8 bits per channel for now; HDR passthrough is what will ask for 10.
-  if (!surface->Create(widget, /*depth_bits=*/8, &error)) {
+  if (!surface->Create(widget, &error)) {
     g_message("MPV: native video plane unavailable (%s); using the Flutter texture path", error.c_str());
     return FALSE;
   }
@@ -449,6 +448,35 @@ static void mpv_plugin_handle_method_call(FlMethodChannel* channel, FlMethodCall
         response = FL_METHOD_RESPONSE(fl_method_error_response_new("INVALID_ARGS", "Missing 'name'", nullptr));
       } else if (value_value == nullptr || fl_value_get_type(value_value) != FL_VALUE_TYPE_STRING) {
         response = FL_METHOD_RESPONSE(fl_method_error_response_new("INVALID_ARGS", "Missing 'value'", nullptr));
+      } else if (
+          self->video_surface && g_strcmp0(fl_value_get_string(name_value), "hdr-enabled") == 0) {
+        // HDR spans both halves of the plane: mpv has to emit PQ / BT.2020, and
+        // the compositor has to be told that is what the buffer holds. Neither
+        // alone produces HDR, so this cannot go through the plain property path.
+        const bool enabled =
+            plezy::mpv_common::ParseEnabledFlag(fl_value_get_string(value_value));
+        if (!self->video_surface->supports_hdr() && enabled) {
+          response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+              "HDR_UNSUPPORTED", "This compositor or video plane cannot carry HDR", nullptr));
+        } else {
+          // TODO: forward the source's MaxCLL/MaxFALL once the mastering
+          // metadata is read back from mpv's video-params; zero fields simply
+          // leave the compositor on its own defaults.
+          self->video_surface->SetHdr(enabled, mpv::HdrMetadata{});
+          g_object_ref(method_call);
+          self->player->SetHdrOutput(enabled, [method_call](int error) {
+            g_autoptr(FlMethodResponse) async_response = nullptr;
+            if (plezy::mpv_common::SetPropertyStatusSucceeded(error)) {
+              async_response = FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
+            } else {
+              async_response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+                  plezy::mpv_common::kSetPropertyFailedCode, mpv_error_string(error), nullptr));
+            }
+            fl_method_call_respond(method_call, async_response, nullptr);
+            g_object_unref(method_call);
+          });
+          return;
+        }
       } else {
         g_object_ref(method_call);
         self->player->SetPropertyAsync(
@@ -548,6 +576,12 @@ static void mpv_plugin_handle_method_call(FlMethodChannel* channel, FlMethodCall
 
       response = FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
     }
+  } else if (strcmp(method, "isHDRSupported") == 0) {
+    // Reports whether the *plane* can be described as HDR, not whether the
+    // display is in HDR mode. On an SDR output the compositor tone-maps the
+    // PQ plane, which is still preferable to mpv guessing at the display.
+    const gboolean supported = self->video_surface && self->video_surface->supports_hdr();
+    response = FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_bool(supported)));
   } else if (strcmp(method, "setVideoRect") == 0) {
     if (!self->video_surface) {
       // Texture mode places video through the Flutter widget tree instead.

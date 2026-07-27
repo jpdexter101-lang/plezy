@@ -37,6 +37,17 @@ pkg_check_modules(WAYLAND_CLIENT REQUIRED IMPORTED_TARGET wayland-client)
 pkg_check_modules(WAYLAND_EGL REQUIRED IMPORTED_TARGET wayland-egl)
 pkg_check_modules(EGL REQUIRED IMPORTED_TARGET egl)
 
+# Vendored wayland-scanner output for color-management-v1, which backs HDR on
+# the native video plane. Built separately because it is C (the runner is C++
+# only) and generated (so it must not be held to -Wall -Werror). See
+# wayland/README.md for why it is committed rather than generated at build time.
+enable_language(C)
+add_library(wayland_protocols STATIC "wayland/color-management-v1-protocol.c")
+target_include_directories(wayland_protocols PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/wayland")
+target_link_libraries(wayland_protocols PUBLIC PkgConfig::WAYLAND_CLIENT)
+target_compile_options(wayland_protocols PRIVATE -w)
+set_property(TARGET wayland_protocols PROPERTY POSITION_INDEPENDENT_CODE ON)
+
 # Build simdutf as a static library from the single-header amalgamation.
 add_library(simdutf STATIC "${simdutf_SOURCE_DIR}/simdutf.cpp")
 target_include_directories(simdutf PUBLIC "${simdutf_SOURCE_DIR}")
@@ -52,10 +63,12 @@ target_link_libraries(${BINARY_NAME} PRIVATE PkgConfig::EPOXY)
 target_link_libraries(${BINARY_NAME} PRIVATE PkgConfig::WAYLAND_CLIENT)
 target_link_libraries(${BINARY_NAME} PRIVATE PkgConfig::WAYLAND_EGL)
 target_link_libraries(${BINARY_NAME} PRIVATE PkgConfig::EGL)
+target_link_libraries(${BINARY_NAME} PRIVATE wayland_protocols)
 target_link_libraries(${BINARY_NAME} PRIVATE simdutf)
 
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}/../shared/cpp")
+target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/wayland")
 
 function(check_mpv_sanitizer_support SANITIZER_FLAG RESULT_VARIABLE)
   include(CheckCXXSourceCompiles)

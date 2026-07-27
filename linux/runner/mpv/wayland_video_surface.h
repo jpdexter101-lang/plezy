@@ -15,8 +15,22 @@ struct wl_egl_window;
 struct wl_subcompositor;
 struct wl_subsurface;
 struct wl_surface;
+struct wp_color_management_surface_v1;
+struct wp_color_manager_v1;
+struct wp_image_description_v1;
 
 namespace mpv {
+
+// HDR10 static metadata carried by the source, as reported by mpv's
+// video-params. A zero field means the source did not carry it, and the
+// corresponding protocol request is then skipped so the compositor can apply
+// its own default rather than being told something untrue.
+struct HdrMetadata {
+  uint32_t max_cll = 0;           // nits, maximum content light level
+  uint32_t max_fall = 0;          // nits, maximum frame-average light level
+  uint32_t max_luminance = 0;     // nits, mastering display maximum
+  double min_luminance = 0.0;     // nits, mastering display minimum
+};
 
 // A native Wayland video plane: a wl_subsurface stacked *below* the Flutter
 // toplevel surface, carrying its own EGL window surface that mpv renders into
@@ -52,10 +66,10 @@ class WaylandVideoSurface {
   // Binds the Wayland globals, creates the subsurface under `view`'s toplevel,
   // and creates an EGL window surface on it.
   //
-  // `depth_bits` is the per-channel colour depth of the EGL config (8 today;
-  // 10 is what HDR passthrough will want). Returns false and fills `error` on
-  // any failure — the caller must then fall back to the Flutter texture path.
-  bool Create(GtkWidget* view, int depth_bits, std::string* error);
+  // The plane is created at 10 bits per channel when the driver offers such a
+  // window config, falling back to 8. Returns false and fills `error` on any
+  // failure — the caller must then fall back to the Flutter texture path.
+  bool Create(GtkWidget* view, std::string* error);
 
   // Releases the EGL surface, subsurface and Wayland objects. Idempotent.
   void Destroy();
@@ -94,13 +108,37 @@ class WaylandVideoSurface {
   // while a frame is still pending.
   bool Present();
 
+  // True when the compositor can describe a PQ / BT.2020 surface, i.e. it
+  // offers a parametric image-description creator and advertises both the
+  // ST2084 transfer function and BT.2020 primaries. This says nothing about
+  // whether the *display* is HDR: an SDR output simply means the compositor
+  // tone-maps the plane instead of passing it through.
+  bool supports_hdr() const { return supports_hdr_; }
+
+  // Number of bits per colour channel the plane actually got (10 when the
+  // driver offered a 10-bit window config, otherwise 8). PQ in 8 bits bands
+  // badly, so HDR is only offered at 10.
+  int depth_bits() const { return depth_bits_; }
+
+  // Describes the plane as PQ / BT.2020, or clears the description so it is
+  // treated as sRGB again. Building an image description is asynchronous: the
+  // compositor validates it and answers ready or failed, and only then is it
+  // attached, landing on a subsequent commit.
+  void SetHdr(bool enabled, const HdrMetadata& metadata);
+  bool hdr_requested() const { return hdr_requested_; }
+  bool hdr_active() const { return hdr_active_; }
+
  private:
   bool BindGlobals(GdkDisplay* display, std::string* error);
-  bool InitEgl(int depth_bits, std::string* error);
+  bool InitEgl(std::string* error);
   void RequestParentCommit();
   void ClearFrameCallback();
+  void ClearImageDescription();
 
   static void HandleFrameDone(void* data, wl_callback* callback, uint32_t time);
+  static void HandleImageDescriptionReady(void* data, wp_image_description_v1* desc, uint32_t identity);
+  static void HandleImageDescriptionFailed(void* data, wp_image_description_v1* desc, uint32_t cause,
+                                           const char* message);
 
   GtkWidget* view_ = nullptr;
 
@@ -125,6 +163,14 @@ class WaylandVideoSurface {
   bool frame_pending_ = false;
   wl_callback* frame_callback_ = nullptr;
   std::function<void()> on_frame_;
+
+  wp_color_manager_v1* color_manager_ = nullptr;
+  wp_color_management_surface_v1* color_surface_ = nullptr;
+  wp_image_description_v1* image_description_ = nullptr;
+  int depth_bits_ = 8;
+  bool supports_hdr_ = false;
+  bool hdr_requested_ = false;
+  bool hdr_active_ = false;
 };
 
 }  // namespace mpv

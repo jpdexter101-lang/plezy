@@ -582,6 +582,15 @@ bool MpvPlayer::InitRenderContextForSurface(EGLDisplay display, EGLConfig config
     return false;
   }
 
+  // Now that a context is current, the surface's swap interval can be set.
+  // eglSwapBuffers runs on the GTK main thread and must never block: at the
+  // default interval Mesa throttles it on the compositor's frame callback,
+  // which an occluded surface never receives. The plane paces itself with its
+  // own frame callback instead.
+  if (!eglSwapInterval(display, 0)) {
+    g_warning("MPV: could not disable EGL swap throttling on the video plane: 0x%x", eglGetError());
+  }
+
   mpv_opengl_init_params gl_init_params{};
   gl_init_params.get_proc_address = get_opengl_proc_address;
   gl_init_params.get_proc_address_ctx = nullptr;
@@ -1147,6 +1156,20 @@ void MpvPlayer::SendEvent(const std::string& name, FlValue* data) {
   }
   if (callback) callback(event_map);
   fl_value_unref(event_map);
+}
+
+void MpvPlayer::SetHdrOutput(bool enabled, StatusCallback callback) {
+  if (disposed_ || !mpv_) {
+    if (callback) callback(MPV_ERROR_UNINITIALIZED);
+    return;
+  }
+  // Passthrough: encode PQ / BT.2020 and leave the peak at the PQ nominal so
+  // the renderer does not tone-map — the compositor owns that decision now,
+  // and on an SDR output it is the one that maps the plane down.
+  // target-peak stays auto in both directions: under PQ that resolves to the
+  // format's nominal 10000 nits, which is exactly the "do not tone-map" case.
+  SetPropertyAsync("target-prim", enabled ? "bt.2020" : "auto", nullptr);
+  SetPropertyAsync("target-trc", enabled ? "pq" : "auto", std::move(callback));
 }
 
 void MpvPlayer::SetHDREnabled(bool enabled, StatusCallback callback) {
