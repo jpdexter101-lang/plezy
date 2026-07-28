@@ -24,6 +24,11 @@ struct _MpvPlugin {
   // surface instead of through a Flutter texture. Mutually exclusive with
   // |texture|; see mpv_plugin_start_video().
   VideoSurfacePtr video_surface;
+  // Set when the plane must be redrawn even though mpv has no new frame -
+  // after a resize or after becoming visible, where the buffer on screen is
+  // stale or absent. Sticky, because the render it asks for may first have to
+  // wait out an unacknowledged frame.
+  gboolean plane_needs_render;
   gboolean texture_registered;
   gboolean visible;
   gboolean initialized;
@@ -97,22 +102,33 @@ static void release_video_resources(MpvPlugin* self) {
   }
   self->initialized = FALSE;
   self->visible = FALSE;
+  self->plane_needs_render = FALSE;
 }
 
 // Renders and presents one frame on the native video plane. Skipped while the
 // plane is hidden or has not been given a rect yet; both of those paths render
 // explicitly once the condition clears, because mpv's redraw latch stays set
 // until a render consumes it and would otherwise suppress every later frame.
-static void render_video_plane(MpvPlugin* self) {
+//
+// |force| is for the callers who need pixels regardless of whether mpv has
+// produced a new frame: a resize, or the plane becoming visible again.
+static void render_video_plane(MpvPlugin* self, gboolean force) {
+  if (force) self->plane_needs_render = TRUE;
   if (!self->player || !self->video_surface || !self->video_surface->valid()) return;
   if (!self->video_surface->visible() || !self->video_surface->has_size()) return;
   // Skip entirely while the compositor has not acknowledged the last frame:
   // an occluded plane is never acknowledged, and rendering into it anyway
   // would burn GPU work on frames that can never be shown.
   if (self->video_surface->frame_pending()) return;
+  // The frame callback fires once per *display* refresh, so rendering from it
+  // unconditionally pins the plane to the monitor's rate - 120 swaps/s for
+  // 60fps content on a 120Hz output, half of them redrawing the same picture.
+  // mpv's redraw latch is what says a new frame actually exists.
+  if (!self->plane_needs_render && !self->player->NeedsRedraw()) return;
   if (self->player->RenderToSurface(
           self->video_surface->egl_surface(), self->video_surface->width(),
           self->video_surface->height())) {
+    self->plane_needs_render = FALSE;
     self->video_surface->Present();
   }
 }
@@ -145,8 +161,8 @@ static gboolean try_start_video_plane(MpvPlugin* self, FlView* view) {
   }
 
   self->video_surface = std::move(surface);
-  self->video_surface->SetFrameCallback([self]() { render_video_plane(self); });
-  self->player->SetRedrawCallback([self]() { render_video_plane(self); });
+  self->video_surface->SetFrameCallback([self]() { render_video_plane(self, FALSE); });
+  self->player->SetRedrawCallback([self]() { render_video_plane(self, FALSE); });
   return TRUE;
 }
 
@@ -568,7 +584,7 @@ static void mpv_plugin_handle_method_call(FlMethodChannel* channel, FlMethodCall
         self->video_surface->SetVisible(self->visible);
         // Becoming visible has to render explicitly: the redraw latch was
         // consumed (or suppressed) while hidden, so no callback is pending.
-        if (self->visible) render_video_plane(self);
+        if (self->visible) render_video_plane(self, TRUE);
       } else if (self->visible && self->texture) {
         // Trigger a frame render when becoming visible
         mpv_texture_mark_frame_available(self->texture);
@@ -614,7 +630,7 @@ static void mpv_plugin_handle_method_call(FlMethodChannel* channel, FlMethodCall
             static_cast<int32_t>(bottom - top), scale);
         // Re-render at the new size straight away; waiting for the next mpv
         // frame would leave a stale buffer stretched across the new rect.
-        render_video_plane(self);
+        render_video_plane(self, TRUE);
         response = FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
       }
     }
