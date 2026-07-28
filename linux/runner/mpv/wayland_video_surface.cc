@@ -26,6 +26,7 @@ struct RegistryTarget {
   bool parametric = false;
   bool pq = false;
   bool bt2020 = false;
+  bool mastering = false;
   bool done = false;
 };
 
@@ -36,6 +37,12 @@ void ManagerFeature(void* data, wp_color_manager_v1* manager, uint32_t feature) 
   (void)manager;
   auto* target = static_cast<RegistryTarget*>(data);
   if (feature == WP_COLOR_MANAGER_V1_FEATURE_PARAMETRIC) target->parametric = true;
+  // Gates set_mastering_luminance as well as the primaries request it is named
+  // after. Sending either without this advertised is a fatal protocol error,
+  // not a soft failure, so it has to be tracked rather than assumed.
+  if (feature == WP_COLOR_MANAGER_V1_FEATURE_SET_MASTERING_DISPLAY_PRIMARIES) {
+    target->mastering = true;
+  }
 }
 void ManagerTransferFunction(void* data, wp_color_manager_v1* manager, uint32_t tf) {
   (void)manager;
@@ -143,6 +150,10 @@ bool WaylandVideoSurface::BindGlobals(GdkDisplay* display, std::string* error) {
     // All three are required to describe a plane as HDR10. Anything less and
     // the plane simply stays sRGB and mpv keeps tone-mapping as it does today.
     supports_hdr_ = target.done && target.parametric && target.pq && target.bt2020;
+    // Optional on top: without it the plane is still described as PQ / BT.2020,
+    // the compositor just has to tone-map against its own assumptions rather
+    // than the source's mastering display.
+    supports_mastering_ = target.mastering;
     if (!supports_hdr_) {
       g_message(
           "MPV video plane: compositor colour management is incomplete "
@@ -294,9 +305,24 @@ void WaylandVideoSurface::HandleImageDescriptionFailed(
   self->ClearImageDescription();
 }
 
+namespace {
+
+bool SameMetadata(const HdrMetadata& a, const HdrMetadata& b) {
+  return a.max_cll == b.max_cll && a.max_fall == b.max_fall &&
+         a.max_luminance == b.max_luminance && a.min_luminance == b.min_luminance;
+}
+
+}  // namespace
+
 void WaylandVideoSurface::SetHdr(bool enabled, const HdrMetadata& metadata) {
   if (!supports_hdr_ || color_surface_ == nullptr) return;
-  if (enabled == hdr_requested_ && (!enabled || image_description_ != nullptr)) return;
+  if (enabled == hdr_requested_ && (!enabled || image_description_ != nullptr)) {
+    // Already in the requested state, but the caller may have learned more
+    // about the source since - HDR is commonly switched on before a file is
+    // open, when there is no metadata to read yet.
+    if (enabled) RefreshHdrMetadata(metadata);
+    return;
+  }
 
   hdr_requested_ = enabled;
   ClearImageDescription();
@@ -310,6 +336,22 @@ void WaylandVideoSurface::SetHdr(bool enabled, const HdrMetadata& metadata) {
     return;
   }
 
+  metadata_ = metadata;
+  BuildImageDescription();
+}
+
+void WaylandVideoSurface::RefreshHdrMetadata(const HdrMetadata& metadata) {
+  if (!hdr_requested_ || !supports_hdr_ || color_surface_ == nullptr) return;
+  if (SameMetadata(metadata_, metadata)) return;
+  metadata_ = metadata;
+  // The description is immutable once created, so new metadata means building
+  // a replacement and swapping it in on the next commit.
+  ClearImageDescription();
+  BuildImageDescription();
+}
+
+void WaylandVideoSurface::BuildImageDescription() {
+  const HdrMetadata& metadata = metadata_;
   wp_image_description_creator_params_v1* creator =
       wp_color_manager_v1_create_parametric_creator(color_manager_);
   if (creator == nullptr) {
@@ -326,9 +368,21 @@ void WaylandVideoSurface::SetHdr(bool enabled, const HdrMetadata& metadata) {
   // Only forward metadata the source actually carried. Inventing values here
   // would have the compositor tone-map against a mastering display that never
   // existed, which is worse than letting it apply its own default.
-  if (metadata.max_luminance > 0) {
-    wp_image_description_creator_params_v1_set_mastering_luminance(
-        creator, static_cast<uint32_t>(metadata.min_luminance * 10000.0), metadata.max_luminance);
+  //
+  // Without any of this the compositor has to assume the worst case the PQ
+  // curve allows - 10000 nits - and rolls the highlights off far harder than
+  // the content needs, which is visible as crushed, flat highlights next to a
+  // player that does forward it.
+  if (supports_mastering_ && metadata.max_luminance > 0) {
+    // min L is carried scaled by 10000 to keep four decimals. The protocol
+    // raises invalid_luminance - a fatal error, not a rejected description -
+    // if max is not strictly greater than min, so clamp rather than trust the
+    // file.
+    const uint32_t min_lum = static_cast<uint32_t>(metadata.min_luminance * 10000.0 + 0.5);
+    const uint32_t max_lum = metadata.max_luminance;
+    if (max_lum * 10000u > min_lum) {
+      wp_image_description_creator_params_v1_set_mastering_luminance(creator, min_lum, max_lum);
+    }
   }
   if (metadata.max_cll > 0) {
     wp_image_description_creator_params_v1_set_max_cll(creator, metadata.max_cll);

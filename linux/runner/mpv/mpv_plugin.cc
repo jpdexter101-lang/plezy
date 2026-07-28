@@ -45,7 +45,25 @@ G_DEFINE_TYPE(MpvPlugin, mpv_plugin, G_TYPE_OBJECT)
 // Forward declarations
 static void mpv_plugin_handle_method_call(FlMethodChannel* channel, FlMethodCall* method_call, gpointer user_data);
 
+static mpv::HdrMetadata read_source_hdr_metadata(MpvPlugin* self);
+
+// Events reach Dart unchanged; this only watches them go past. A playback
+// restart is the first moment the source's HDR metadata is knowable, and HDR
+// is normally switched on well before that - typically before any file is
+// open - so the image description built back then has to be revisited.
+// Refreshing is cheap and self-cancelling when nothing changed, which matters
+// because this also fires on every seek.
+static void observe_event_for_hdr(MpvPlugin* self, FlValue* event) {
+  if (!self->video_surface || !self->video_surface->hdr_requested()) return;
+  if (event == nullptr || fl_value_get_type(event) != FL_VALUE_TYPE_MAP) return;
+  FlValue* name = fl_value_lookup_string(event, "name");
+  if (name == nullptr || fl_value_get_type(name) != FL_VALUE_TYPE_STRING) return;
+  if (g_strcmp0(fl_value_get_string(name), "playback-restart") != 0) return;
+  self->video_surface->RefreshHdrMetadata(read_source_hdr_metadata(self));
+}
+
 static void send_event(MpvPlugin* self, FlValue* event) {
+  observe_event_for_hdr(self, event);
   if (self->event_channel) {
     g_autoptr(GError) error = nullptr;
     if (!fl_event_channel_send(self->event_channel, event, nullptr, &error) && error != nullptr) {
@@ -131,6 +149,36 @@ static void render_video_plane(MpvPlugin* self, gboolean force) {
     self->plane_needs_render = FALSE;
     self->video_surface->Present();
   }
+}
+
+// Collects the source's HDR10 static metadata for the compositor. Without it
+// the compositor can only assume the worst case the PQ curve permits - 10000
+// nits - and rolls the highlights off much harder than the content needs.
+//
+// The protocol carries these as whole nits, and a value that rounds to zero
+// would read as "not stated", so anything positive is kept at a minimum of 1.
+static mpv::HdrMetadata read_source_hdr_metadata(MpvPlugin* self) {
+  mpv::HdrMetadata metadata;
+  if (!self->player) return metadata;
+  mpv::MpvPlayer::SourceHdrMetadata source;
+  if (!self->player->ReadSourceHdrMetadata(&source)) {
+    g_message("MPV video plane: source carries no HDR10 metadata; compositor will use its defaults");
+    return metadata;
+  }
+  auto nits = [](double value) -> uint32_t {
+    if (!(value > 0.0)) return 0;
+    const double rounded = value + 0.5;
+    if (rounded >= 4294967295.0) return 4294967295u;
+    const uint32_t whole = static_cast<uint32_t>(rounded);
+    return whole > 0 ? whole : 1;
+  };
+  metadata.max_cll = nits(source.max_cll);
+  metadata.max_fall = nits(source.max_fall);
+  metadata.max_luminance = nits(source.max_luminance);
+  metadata.min_luminance = source.min_luminance;
+  g_message("MPV video plane: source HDR10 metadata MaxCLL=%u MaxFALL=%u mastering=%.4f-%u nits",
+            metadata.max_cll, metadata.max_fall, metadata.min_luminance, metadata.max_luminance);
+  return metadata;
 }
 
 // Attempts the native Wayland video plane. Returns false when it is
@@ -475,10 +523,7 @@ static void mpv_plugin_handle_method_call(FlMethodChannel* channel, FlMethodCall
           response = FL_METHOD_RESPONSE(fl_method_error_response_new(
               "HDR_UNSUPPORTED", "This compositor or video plane cannot carry HDR", nullptr));
         } else {
-          // TODO: forward the source's MaxCLL/MaxFALL once the mastering
-          // metadata is read back from mpv's video-params; zero fields simply
-          // leave the compositor on its own defaults.
-          self->video_surface->SetHdr(enabled, mpv::HdrMetadata{});
+          self->video_surface->SetHdr(enabled, read_source_hdr_metadata(self));
           g_object_ref(method_call);
           self->player->SetHdrOutput(enabled, [method_call](int error) {
             g_autoptr(FlMethodResponse) async_response = nullptr;

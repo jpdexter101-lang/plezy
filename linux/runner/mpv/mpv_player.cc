@@ -770,6 +770,35 @@ void MpvPlayer::SetPropertyAsync(const std::string& name, const std::string& val
   plezy::mpv_common::SubmitSetPropertyAsync(mpv_, pending_requests_, name, value, std::move(callback));
 }
 
+bool MpvPlayer::ReadSourceHdrMetadata(SourceHdrMetadata* out) {
+  if (out == nullptr) return false;
+  std::lock_guard<std::mutex> lock(native_mutex_);
+  if (disposed_ || !mpv_) return false;
+
+  // Each of these is absent unless the stream actually carried it, and mpv
+  // reports that as an error rather than a zero, so a failed read is a normal
+  // outcome and leaves the field at zero.
+  auto read = [this](const char* name, double* value) {
+    double parsed = 0.0;
+    if (mpv_get_property(mpv_, name, MPV_FORMAT_DOUBLE, &parsed) < 0) return false;
+    if (!(parsed > 0.0)) return false;
+    *value = parsed;
+    return true;
+  };
+
+  bool any = read("video-params/max-cll", &out->max_cll);
+  any |= read("video-params/max-fall", &out->max_fall);
+  any |= read("video-params/max-luma", &out->max_luminance);
+  // A zero floor is legitimate here, unlike the others, so it is read on its
+  // own terms and never decides whether metadata was present.
+  double min_luma = 0.0;
+  if (mpv_get_property(mpv_, "video-params/min-luma", MPV_FORMAT_DOUBLE, &min_luma) >= 0 &&
+      min_luma >= 0.0) {
+    out->min_luminance = min_luma;
+  }
+  return any;
+}
+
 void MpvPlayer::GetPropertyAsync(const std::string& name, GetPropertyCallback callback) {
   if (disposed_ || !mpv_) {
     if (callback) callback(MPV_ERROR_UNINITIALIZED, "");

@@ -125,11 +125,19 @@ class WaylandVideoSurface {
   // compositor validates it and answers ready or failed, and only then is it
   // attached, landing on a subsequent commit.
   void SetHdr(bool enabled, const HdrMetadata& metadata);
+
+  // Replaces the description when the source's metadata becomes known or
+  // changes. A no-op unless HDR is on and the metadata actually moved, so it
+  // is safe to call on every playback restart - which is where it is needed,
+  // since HDR is usually switched on before any file is open.
+  void RefreshHdrMetadata(const HdrMetadata& metadata);
+
   bool hdr_requested() const { return hdr_requested_; }
   bool hdr_active() const { return hdr_active_; }
 
  private:
   bool BindGlobals(GdkDisplay* display, std::string* error);
+  void BuildImageDescription();
   bool InitEgl(std::string* error);
   void RequestParentCommit();
   void ClearFrameCallback();
@@ -167,8 +175,10 @@ class WaylandVideoSurface {
   wp_color_manager_v1* color_manager_ = nullptr;
   wp_color_management_surface_v1* color_surface_ = nullptr;
   wp_image_description_v1* image_description_ = nullptr;
+  HdrMetadata metadata_;
   int depth_bits_ = 8;
   bool supports_hdr_ = false;
+  bool supports_mastering_ = false;
   bool hdr_requested_ = false;
   bool hdr_active_ = false;
 };

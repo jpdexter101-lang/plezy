@@ -155,6 +155,20 @@ class MpvPlayer {
   /// ignores it entirely. target-trc/target-prim are what that renderer reads.
   void SetHdrOutput(bool enabled, StatusCallback callback);
 
+  /// HDR10 static metadata as carried by the current source. A zero field
+  /// means the file did not state it.
+  struct SourceHdrMetadata {
+    double max_cll = 0.0;        ///< nits, maximum content light level
+    double max_fall = 0.0;       ///< nits, maximum frame-average light level
+    double max_luminance = 0.0;  ///< nits, mastering display maximum
+    double min_luminance = 0.0;  ///< nits, mastering display minimum
+  };
+
+  /// Reads the current source's HDR10 static metadata, returning false when
+  /// the file carries none. Synchronous, but only reads already-parsed stream
+  /// parameters rather than reaching into the decoder.
+  bool ReadSourceHdrMetadata(SourceHdrMetadata* out);
+
   /// Gets an mpv property value asynchronously.
   void GetPropertyAsync(const std::string& name, GetPropertyCallback callback);
 
