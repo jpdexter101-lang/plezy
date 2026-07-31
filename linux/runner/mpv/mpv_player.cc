@@ -1400,6 +1400,29 @@ void MpvPlayer::RunPendingHdrOutput() {
   // Player-side mapping onto an HDR output aims at a PQ target instead, and
   // nothing has been measured there yet - that needs the external display - so
   // it keeps mpv's own choice until it can be judged the same way.
+  //
+  // mobius's shape is governed by tone-mapping-param, its transition point: below
+  // it the curve is 1:1, above it rolls off. Left at mpv's default 0.3 because
+  // that measured best, not by omission. Raising it trades highlight shoulder for
+  // in-range luminance, and against libplacebo's rendering of the same chart
+  // (400/700/1000 -> 238.5/253.8/254.8, 100 nits -> 134.0) the default is closest
+  // on both counts, with higher values moving away on each:
+  //
+  //   param   100 nits   400->1000 span
+  //   0.30     179.0      17.1
+  //   0.45     184.4      12.1
+  //   0.60     185.0       7.2
+  //
+  // It also does not touch the cost this operator carries. On real 1000-nit
+  // footage mobius sits 0.027 dxy and ~12% darker than BT.2390 whatever the
+  // transition point is (0.30/0.38/0.45 measured identical), because that
+  // difference is gamut handling rather than the tone curve, and a dark scene's
+  // pixels fall below the transition point in every case.
+  //
+  // Not pinned explicitly: the option has no accepted "unset" token - `default`
+  // is rejected - so writing it would leave a mobius-specific value applied to
+  // whatever operator runs next, including BT.2390 on the unmeasured HDR-output
+  // path. Recorded here instead so an upstream default change is diagnosable.
   const char* operator_name = (tone_map_here && !enabled) ? "mobius" : "auto";
 
   // The values that decide who tone-maps and against what, none of which is
