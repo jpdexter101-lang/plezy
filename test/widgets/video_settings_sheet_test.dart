@@ -171,24 +171,22 @@ void main() {
     expect(find.text('HDR Tone Mapping'), findsNothing);
   });
 
-  // With supportsHdrControl left null the sheet asks the player, which is the
-  // path that actually ships on Linux. The two above inject the answer and so
-  // only cover the gate, not the probe behind it.
+  // supportsHdrControl left null so the sheet asks the player, which is the path
+  // that ships on Linux. The cases above inject the answer and so cover only the
+  // gate, not the probe behind it. A tall sheet builds every row, so presence is
+  // asserted directly instead of dragging a lazy list to the row under test.
   testWidgets('a Linux player reporting no HDR output hides the controls', (tester) async {
     final player = _FakeSettingsPlayer(hdrOutputSupported: false);
-    await _pumpSheet(tester, player: player);
+    await _pumpSheet(tester, player: player, supportsHdrControl: null, height: 4000);
 
-    await tester.scrollUntilVisible(find.text('Auto-Play Next'), 500, scrollable: find.byType(Scrollable).first);
-
+    expect(find.text('Auto-Play Next'), findsOneWidget, reason: 'the list should be fully built');
     expect(find.text('HDR'), findsNothing);
     expect(find.text('HDR Tone Mapping'), findsNothing);
   }, skip: !Platform.isLinux);
 
   testWidgets('a Linux player reporting an HDR output reveals the controls', (tester) async {
     final player = _FakeSettingsPlayer(hdrOutputSupported: true);
-    await _pumpSheet(tester, player: player);
-
-    await tester.scrollUntilVisible(find.text('HDR'), 500, scrollable: find.byType(Scrollable).first);
+    await _pumpSheet(tester, player: player, supportsHdrControl: null, height: 4000);
 
     expect(find.text('HDR'), findsOneWidget);
     expect(find.text('HDR Tone Mapping'), findsOneWidget);
@@ -231,14 +229,19 @@ Future<void> _pumpSheet(
   WidgetTester tester, {
   bool canControl = false,
   Player? player,
-  bool supportsHdrControl = false,
+  // Explicitly false by default so the sheet does not consult the platform.
+  // Pass null to exercise the capability probe instead.
+  bool? supportsHdrControl = false,
   // Option views that dismiss themselves on selection reach
   // OverlaySheetController.of(), which asserts without a host above it.
   bool hosted = false,
+  // Tall enough and the whole list is built, so presence can be asserted without
+  // dragging a lazy ListView past the row under test.
+  double height = 700,
 }) async {
   final sheet = SizedBox(
     width: 900,
-    height: 700,
+    height: height,
     child: VideoSettingsSheet(
       player: player ?? _FakeSettingsPlayer(),
       supportsHdrControl: supportsHdrControl,
