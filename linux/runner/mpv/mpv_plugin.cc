@@ -338,6 +338,7 @@ static void apply_hdr_state(MpvPlugin* self, bool allow, mpv::HdrToneMapping mod
   inputs.source_describable = self->video_surface->CanDescribeSource(source);
   inputs.requested = mode;
   inputs.display_peak_nits = self->video_surface->preferred().max_luminance;
+  inputs.sdr_reference_nits = self->video_surface->preferred().reference_luminance;
   const mpv::HdrDecision decision = mpv::DecideHdr(inputs, source);
 
   // What the buffer will actually contain: the source untouched, or the same
@@ -518,6 +519,7 @@ static void handle_preferred_changed(MpvPlugin* self) {
   inputs.source_describable = self->video_surface->CanDescribeSource(source);
   inputs.requested = self->hdr_tone_mapping_desired;
   inputs.display_peak_nits = self->video_surface->preferred().max_luminance;
+  inputs.sdr_reference_nits = self->video_surface->preferred().reference_luminance;
   const mpv::HdrDecision decision = mpv::DecideHdr(inputs, source);
 
   if (decision.describe == self->video_surface->hdr_active() &&

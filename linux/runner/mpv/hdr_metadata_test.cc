@@ -356,7 +356,7 @@ const mpv::SourceTransfer kHdrTransfers[] = {mpv::SourceTransfer::kPq, mpv::Sour
 
 mpv::HdrInputs Inputs(
     bool allowed, bool client, bool output, bool source,
-    mpv::HdrToneMapping requested = mpv::HdrToneMapping::kCompositor, uint32_t peak = 0) {
+    mpv::HdrToneMapping requested = mpv::HdrToneMapping::kCompositor, uint32_t peak = 0, uint32_t sdr_reference = 0) {
   mpv::HdrInputs inputs;
   inputs.allowed = allowed;
   inputs.client_can_describe = client;
@@ -364,6 +364,7 @@ mpv::HdrInputs Inputs(
   inputs.source_describable = source;
   inputs.requested = requested;
   inputs.display_peak_nits = peak;
+  inputs.sdr_reference_nits = sdr_reference;
   return inputs;
 }
 
@@ -392,6 +393,64 @@ void TestCompositorModeLeavesPeakAuto() {
 void TestPlayerModeAdoptsDisplayPeak() {
   const auto decision = mpv::DecideHdr(
       Inputs(true, true, true, true, mpv::HdrToneMapping::kPlayer, 600), Metadata(10000, 600, 10000, 0.0001));
+  EXPECT(decision.describe);
+  EXPECT(decision.tone_map_in_player);
+  EXPECT(decision.target_peak_nits == 600);
+}
+
+// An HDR source on an SDR output is the fallback path, and mpv still has to be
+// told what it is mapping to. Left on auto with no window it does not tone-map at
+// all, so the peak has to come from the output's diffuse white - not from the
+// HDR-mode peak, which an SDR signal cannot reach.
+void TestUndescribedHdrSourceAdoptsSdrReference() {
+  for (const mpv::SourceTransfer transfer : kHdrTransfers) {
+    const auto source = Metadata(1000, 400, 1000, 0.0001, transfer);
+    // output_is_hdr false: the one gate that puts us on this path on an SDR panel.
+    const auto decision =
+        mpv::DecideHdr(Inputs(true, true, false, true, mpv::HdrToneMapping::kCompositor, 600, 200), source);
+    EXPECT(!decision.describe);
+    // mpv reduces the range here, so the flag says so; `describe` is what keeps
+    // metadata off the surface.
+    EXPECT(decision.tone_map_in_player);
+    EXPECT(decision.target_peak_nits == 200);
+  }
+}
+
+// Without a reference white there is nothing to aim at, and inventing one would
+// be worse than mpv's own default.
+void TestUndescribedWithoutSdrReferenceStaysAuto() {
+  const auto source = Metadata(1000, 400, 1000, 0.0001);
+  EXPECT(
+      mpv::DecideHdr(Inputs(true, true, false, true, mpv::HdrToneMapping::kCompositor, 600, 0), source)
+          .target_peak_nits == 0);
+  // Below the option's floor is the same as unknown.
+  EXPECT(
+      mpv::DecideHdr(Inputs(true, true, false, true, mpv::HdrToneMapping::kCompositor, 600, 9), source)
+          .target_peak_nits == 0);
+  EXPECT(
+      mpv::DecideHdr(Inputs(true, true, false, true, mpv::HdrToneMapping::kCompositor, 600, 10), source)
+          .target_peak_nits == 10);
+}
+
+// The regression this guard exists for: an ordinary BT.709 file has nothing to
+// map down, so naming a peak would change plain SDR playback.
+void TestUndescribedSdrSourceKeepsPeakAuto() {
+  const auto sdr = Metadata(0, 0, 0, 0.0, mpv::SourceTransfer::kSdr);
+  const auto decision =
+      mpv::DecideHdr(Inputs(true, true, false, true, mpv::HdrToneMapping::kCompositor, 600, 200), sdr);
+  EXPECT(!decision.describe);
+  EXPECT(decision.target_peak_nits == 0);
+  // Also true when every other gate would have passed.
+  EXPECT(
+      mpv::DecideHdr(Inputs(true, true, true, true, mpv::HdrToneMapping::kPlayer, 600, 200), sdr).target_peak_nits ==
+      0);
+}
+
+// On an HDR output the described peak still comes from the HDR-mode peak; the SDR
+// reference must not displace it.
+void TestDescribedPlayerModeIgnoresSdrReference() {
+  const auto source = Metadata(10000, 600, 10000, 0.0001);
+  const auto decision = mpv::DecideHdr(Inputs(true, true, true, true, mpv::HdrToneMapping::kPlayer, 600, 200), source);
   EXPECT(decision.describe);
   EXPECT(decision.tone_map_in_player);
   EXPECT(decision.target_peak_nits == 600);
@@ -480,6 +539,10 @@ int main() {
   TestEachGateCanVeto();
   TestCompositorModeLeavesPeakAuto();
   TestPlayerModeAdoptsDisplayPeak();
+  TestUndescribedHdrSourceAdoptsSdrReference();
+  TestUndescribedWithoutSdrReferenceStaysAuto();
+  TestUndescribedSdrSourceKeepsPeakAuto();
+  TestDescribedPlayerModeIgnoresSdrReference();
   TestPlayerModeWithoutPeakFallsBack();
   TestDecidedPeakMatchesDescribedPeak();
   TestDecidedPeakIsSendable();

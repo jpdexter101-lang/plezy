@@ -256,18 +256,31 @@ struct HdrInputs {
   bool output_is_hdr = false;        // the compositor's preferred transfer function is PQ
   bool source_describable = false;   // this source's curve and gamut are both advertised
   HdrToneMapping requested = HdrToneMapping::kCompositor;
-  uint32_t display_peak_nits = 0;  // from the preferred description; 0 means unknown
+  uint32_t display_peak_nits = 0;  // the output's peak while in HDR; 0 means unknown
+  // The output's diffuse-white luminance, which is the most an SDR signal can
+  // reach on it. Distinct from display_peak_nits: this panel reports a 600-nit
+  // peak but 200-nit reference white, and only the latter is reachable without
+  // an HDR description attached. 0 means unknown.
+  uint32_t sdr_reference_nits = 0;
 };
 
 // What to do about it.
 struct HdrDecision {
   bool describe = false;            // attach an image description at all
   bool tone_map_in_player = false;  // mpv reduces the range rather than the compositor
-  // The peak mpv aims at *and* the peak declared to the compositor — deliberately
-  // one number, because the two disagreeing is what makes a compositor remap a
-  // signal twice. Zero means target-peak stays on auto.
+  // The peak mpv aims at. While a description is attached it is also the peak
+  // declared to the compositor — deliberately one number, because the two
+  // disagreeing is what makes a compositor remap a signal twice. Zero means
+  // target-peak stays on auto.
   uint32_t target_peak_nits = 0;
 };
+
+// mpv's target-peak option accepts 10..10000; outside that there is nothing
+// sensible to aim at and auto is the honest answer.
+inline uint32_t UsableTargetPeak(uint32_t nits, uint32_t volume_max) {
+  if (nits > volume_max) nits = volume_max;
+  return nits >= 10 ? nits : 0;
+}
 
 // The single gate. Four independent conditions must hold before a plane is
 // described as HDR, and they come from four different places: the user's
@@ -275,25 +288,45 @@ struct HdrDecision {
 // and the file. Any one of them failing means falling back to mpv's ordinary
 // tone-mapped SDR output, which is always safe.
 //
-// Player-side tone mapping additionally needs to know what to map *to*. Without
-// a peak from the preferred description there is nothing to aim at, so it
-// degrades to passthrough rather than inventing a target.
+// Both branches have to tell mpv what it is mapping to, for the same reason and
+// from different fields. The render API has no window, so mpv cannot discover
+// the display the way a windowed `mpv` does: left on auto it does not tone-map
+// at all, it encodes against a nominal reference white and clips everything
+// above it. Measured on a 1000-nit source that put 400, 700 and 1000 nits within
+// six code values of each other, while the same renderer given a real target
+// still separated them.
+//
+// Which field is right depends on what the plane will carry. Described, the
+// output is in HDR and its peak is reachable. Undescribed, the buffer is an
+// ordinary SDR signal whose maximum is the output's diffuse white, and claiming
+// the HDR peak there would ask for range the encoding cannot express.
+//
+// The undescribed target applies only to an HDR *source*. An ordinary BT.709 file
+// has nothing to map down: naming a peak for it would change plain SDR playback,
+// which this has no business touching.
 inline HdrDecision DecideHdr(const HdrInputs& inputs, const HdrMetadata& source) {
   HdrDecision decision;
   decision.describe = inputs.allowed && inputs.client_can_describe && inputs.output_is_hdr &&
                       inputs.source_describable && SourceIsHdr(source);
-  if (!decision.describe) return decision;
+  if (!decision.describe) {
+    if (SourceIsHdr(source)) {
+      // No curve is being declared, so nothing constrains this to a primary
+      // colour volume; the only ceiling is what the option accepts.
+      decision.target_peak_nits = UsableTargetPeak(inputs.sdr_reference_nits, kPqMaxLuminanceNits);
+      // mpv is the one reducing the range here, which is exactly what this flag
+      // says. `describe` independently keeps any metadata off the surface, so
+      // recording it truthfully costs nothing and keeps the decision coherent.
+      decision.tone_map_in_player = decision.target_peak_nits > 0;
+    }
+    return decision;
+  }
 
   if (inputs.requested == HdrToneMapping::kPlayer && inputs.display_peak_nits > 0) {
     // Clamped to the curve's primary colour volume here rather than at the two
     // call sites, so the peak handed to mpv and the peak in the description are
     // the same number by construction.
-    const uint32_t volume_max = PrimaryVolumeMaxNits(source.transfer);
-    uint32_t peak = inputs.display_peak_nits;
-    if (peak > volume_max) peak = volume_max;
-    // mpv's target-peak option only accepts 10..10000; below that there is
-    // nothing sensible to aim at.
-    if (peak >= 10) {
+    const uint32_t peak = UsableTargetPeak(inputs.display_peak_nits, PrimaryVolumeMaxNits(source.transfer));
+    if (peak > 0) {
       decision.tone_map_in_player = true;
       decision.target_peak_nits = peak;
     }

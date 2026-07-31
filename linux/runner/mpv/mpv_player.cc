@@ -1366,17 +1366,24 @@ void MpvPlayer::RunPendingHdrOutput() {
   // to the compositor on success — a silently half-applied set would have the
   // compositor told one thing and shown another.
   //
-  // target-peak decides who tone-maps. Left at auto it resolves, under PQ, to
-  // the format's nominal 10000 nits, so the renderer never tone-maps and the
-  // compositor owns the decision. Set to the display's real peak, mpv tone-maps
-  // to it with BT.2390 and the caller then declares that peak, leaving the
-  // compositor nothing to do.
+  // target-peak is what mpv maps to, and it matters in both directions.
+  //
+  // Under PQ, left on auto it resolves to the format's nominal 10000 nits, so the
+  // renderer never tone-maps and the compositor owns the decision. Set to the
+  // display's real peak, mpv tone-maps to it with BT.2390 and the caller declares
+  // that same peak, leaving the compositor nothing to do.
+  //
+  // On the SDR fallback it is just as load-bearing, which is easy to miss because
+  // the curve and gamut stay on auto there. The render API has no window, so auto
+  // cannot resolve to a display: mpv encodes against a nominal reference white and
+  // clips above it rather than tone-mapping. Hence no `enabled` in the condition
+  // below — an SDR peak is a real instruction, not a leftover from an HDR request.
   const bool enabled = request->transfer != SourceTransfer::kSdr;
   const char* primaries = enabled ? "bt.2020" : "auto";
   const char* curve =
       request->transfer == SourceTransfer::kHlg ? "hlg" : (request->transfer == SourceTransfer::kPq ? "pq" : "auto");
   // The option is an integer in [10, 10000]; anything outside means "auto".
-  const bool tone_map_here = enabled && request->peak_nits >= 10 && request->peak_nits <= kPqMaxLuminanceNits;
+  const bool tone_map_here = request->peak_nits >= 10 && request->peak_nits <= kPqMaxLuminanceNits;
   const std::string peak = tone_map_here ? std::to_string(request->peak_nits) : std::string("auto");
 
   auto changes = std::make_shared<std::vector<PropertyChange>>();
