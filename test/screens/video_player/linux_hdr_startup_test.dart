@@ -12,9 +12,11 @@ import '../../test_helpers/mock_player_channels.dart';
 import '../../test_helpers/prefs.dart';
 
 /// Startup pushes the HDR preference at a native plane that is allowed to refuse
-/// it: the Linux plugin answers `HDR_UNSUPPORTED` whenever the compositor, the
-/// output and the source do not all agree. Losing playback over that would make
-/// the feature worse than not having it.
+/// it: the Linux plugin answers `HDR_UNSUPPORTED` when the video plane and
+/// compositor cannot describe HDR, or the output the window sits on is not in HDR.
+/// That gate runs before any source is considered - startup happens before the
+/// media is open - so a plain SDR monitor is enough to trigger it, and losing
+/// playback over it would make the feature worse than not having it.
 ///
 /// `audio-delay` is written immediately after the HDR block, so its arrival is
 /// what says initialization carried on past the refusal. The matching negative
