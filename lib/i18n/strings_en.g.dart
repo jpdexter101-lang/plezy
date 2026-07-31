@@ -3952,6 +3952,24 @@ class Translations$videoSettings$en {
 	/// en: 'HDR'
 	String get hdr => 'HDR';
 
+	/// en: 'HDR Tone Mapping'
+	String get hdrToneMapping => 'HDR Tone Mapping';
+
+	/// en: 'Choose which side reduces HDR content to what your display can show.'
+	String get hdrToneMappingDescription => 'Choose which side reduces HDR content to what your display can show.';
+
+	/// en: 'Compositor'
+	String get hdrToneMappingCompositor => 'Compositor';
+
+	/// en: 'Pass the source's HDR metadata through and let the desktop compositor map it.'
+	String get hdrToneMappingCompositorDescription => 'Pass the source\'s HDR metadata through and let the desktop compositor map it.';
+
+	/// en: 'Player'
+	String get hdrToneMappingPlayer => 'Player';
+
+	/// en: 'Map to the display's peak brightness in the player, then tell the compositor the result.'
+	String get hdrToneMappingPlayerDescription => 'Map to the display\'s peak brightness in the player, then tell the compositor the result.';
+
 	/// en: 'Audio Output'
 	String get audioOutput => 'Audio Output';
 
@@ -7373,6 +7391,12 @@ extension on Translations {
 			'videoSettings.audioSync' => 'Audio Sync',
 			'videoSettings.subtitleSync' => 'Subtitle Sync',
 			'videoSettings.hdr' => 'HDR',
+			'videoSettings.hdrToneMapping' => 'HDR Tone Mapping',
+			'videoSettings.hdrToneMappingDescription' => 'Choose which side reduces HDR content to what your display can show.',
+			'videoSettings.hdrToneMappingCompositor' => 'Compositor',
+			'videoSettings.hdrToneMappingCompositorDescription' => 'Pass the source\'s HDR metadata through and let the desktop compositor map it.',
+			'videoSettings.hdrToneMappingPlayer' => 'Player',
+			'videoSettings.hdrToneMappingPlayerDescription' => 'Map to the display\'s peak brightness in the player, then tell the compositor the result.',
 			'videoSettings.audioOutput' => 'Audio Output',
 			'videoSettings.performanceOverlay' => 'Performance Overlay',
 			'videoSettings.audioPassthrough' => 'Audio Passthrough',
@@ -7459,14 +7483,14 @@ extension on Translations {
 			'metadataEdit.uploadFile' => 'Upload File',
 			'metadataEdit.enterImageUrl' => 'Enter image URL',
 			'metadataEdit.imageUrl' => 'Image URL',
+			_ => null,
+		} ?? switch (path) {
 			'metadataEdit.metadataUpdated' => 'Metadata updated',
 			'metadataEdit.metadataUpdateFailed' => 'Failed to update metadata',
 			'metadataEdit.artworkUpdated' => 'Artwork updated',
 			'metadataEdit.artworkUpdateFailed' => 'Failed to update artwork',
 			'metadataEdit.noArtworkAvailable' => 'No artwork available',
 			'metadataEdit.artworkOption' => ({required Object index}) => 'Artwork option ${index}',
-			_ => null,
-		} ?? switch (path) {
 			'metadataEdit.selectedArtworkOption' => ({required Object index}) => 'Artwork option ${index}, selected',
 			'metadataEdit.notSet' => 'Not set',
 			'metadataEdit.libraryDefault' => 'Library default',

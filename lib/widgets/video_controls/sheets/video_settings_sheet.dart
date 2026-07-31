@@ -14,6 +14,7 @@ import 'package:provider/provider.dart';
 import '../../../models/shader_preset.dart';
 import '../../../media/playback_rate.dart';
 import '../../../mpv/mpv.dart';
+import '../../../mpv/player/player_native.dart';
 import '../../../providers/shader_provider.dart';
 import '../../../services/file_picker_service.dart';
 import '../../../services/settings_service.dart';
@@ -48,6 +49,7 @@ enum _SettingsView {
   audioDevice,
   shader,
   dvConversion,
+  hdrToneMapping,
 }
 
 class _SettingsMenuItem extends StatelessWidget {
@@ -274,11 +276,19 @@ class _VideoSettingsSheetState extends State<VideoSettingsSheet> {
   late double _zoomScale;
   String _dvConversionMode = 'auto';
   int _dvConversionWriteGeneration = 0;
+  // Linux only, and answered by the native side. Starts false so the toggle
+  // never flashes into view on an output that cannot carry HDR.
+  bool _linuxHdrSupported = false;
+  late HdrToneMapping _hdrToneMapping;
 
   TrackControlsState get _state => widget.trackControlsState;
 
+  // An explicit value from the caller wins. Otherwise the capability is static
+  // per platform, except on Linux where it depends on the compositor, the output
+  // and the plane's bit depth, so it has to be asked for.
   bool get _supportsHdrControl =>
-      widget.supportsHdrControl ?? (Platform.isIOS || Platform.isMacOS || Platform.isWindows);
+      widget.supportsHdrControl ??
+      (Platform.isIOS || Platform.isMacOS || Platform.isWindows || _linuxHdrSupported);
 
   bool get _showDebugDvConversionMode {
     if (!kDebugMode) return false;
@@ -292,7 +302,9 @@ class _VideoSettingsSheetState extends State<VideoSettingsSheet> {
     _audioSyncOffset = _state.audioSyncOffset;
     _subtitleSyncOffset = _state.subtitleSyncOffset;
     _zoomScale = VideoFilterManager.normalizeZoomScale(_state.videoZoomScale);
+    _hdrToneMapping = SettingsService.instance.read(SettingsService.hdrToneMapping);
     _loadDebugDvConversionMode();
+    _loadLinuxHdrSupport();
   }
 
   @override
@@ -311,6 +323,36 @@ class _VideoSettingsSheetState extends State<VideoSettingsSheet> {
     setState(() {
       _dvConversionMode = _normalizeDvConversionMode(dvConversionMode);
     });
+  }
+
+  // Asked once per sheet rather than watched: the answer only changes when the
+  // window moves between monitors, and the sheet is short-lived.
+  Future<void> _loadLinuxHdrSupport() async {
+    if (!Platform.isLinux || widget.supportsHdrControl != null) return;
+    final player = widget.player;
+    if (player is! PlayerNative) return;
+    final supported = await player.isHdrOutputSupported();
+    if (!mounted || player != widget.player || supported == _linuxHdrSupported) return;
+    setState(() {
+      _linuxHdrSupported = supported;
+    });
+  }
+
+  void _setHdrToneMapping(HdrToneMapping mode) {
+    final targetPlayer = widget.player;
+    unawaited(() async {
+      try {
+        await targetPlayer.setProperty('hdr-tone-mapping', mode.name);
+        await SettingsService.instance.write(SettingsService.hdrToneMapping, mode);
+        if (!mounted || targetPlayer != widget.player) return;
+        setState(() {
+          _hdrToneMapping = mode;
+        });
+        OverlaySheetController.of(context).close();
+      } catch (error, stackTrace) {
+        appLogger.w('Failed to set the HDR tone-mapping mode', error: error, stackTrace: stackTrace);
+      }
+    }());
   }
 
   void _setDebugDvConversionMode(String mode) {
@@ -422,6 +464,8 @@ class _VideoSettingsSheetState extends State<VideoSettingsSheet> {
         return t.shaders.title;
       case _SettingsView.dvConversion:
         return 'DV Conversion Mode';
+      case _SettingsView.hdrToneMapping:
+        return t.videoSettings.hdrToneMapping;
     }
   }
 
@@ -447,6 +491,8 @@ class _VideoSettingsSheetState extends State<VideoSettingsSheet> {
         return Symbols.auto_fix_high_rounded;
       case _SettingsView.dvConversion:
         return Symbols.hdr_strong_rounded;
+      case _SettingsView.hdrToneMapping:
+        return Symbols.tonality_rounded;
     }
   }
 
@@ -604,6 +650,18 @@ class _VideoSettingsSheetState extends State<VideoSettingsSheet> {
             icon: Symbols.hdr_strong_rounded,
             title: t.videoSettings.hdr,
             onAfterWrite: (value) => widget.player.setProperty('hdr-enabled', value ? 'yes' : 'no'),
+          ),
+
+        // Only meaningful where the plane can actually carry HDR, and only Linux
+        // has both paths: elsewhere the platform decides who tone-maps.
+        if (_supportsHdrControl && Platform.isLinux)
+          _SettingsMenuItem(
+            icon: Symbols.tonality_rounded,
+            title: t.videoSettings.hdrToneMapping,
+            valueText: _hdrToneMapping == HdrToneMapping.player
+                ? t.videoSettings.hdrToneMappingPlayer
+                : t.videoSettings.hdrToneMappingCompositor,
+            onTap: () => _navigateTo(_SettingsView.hdrToneMapping),
           ),
 
         // Auto-Play Next Episode Toggle
@@ -766,6 +824,36 @@ class _VideoSettingsSheetState extends State<VideoSettingsSheet> {
             subtitle: Text(mode.subtitle, style: TextStyle(color: tokens(context).textMuted, fontSize: 12)),
             trailing: _dvConversionMode == mode.value ? AppIcon(Symbols.check_rounded, fill: 1, color: primary) : null,
             onTap: () => _setDebugDvConversionMode(mode.value),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildHdrToneMappingView() {
+    final modes = [
+      (
+        value: HdrToneMapping.compositor,
+        title: t.videoSettings.hdrToneMappingCompositor,
+        subtitle: t.videoSettings.hdrToneMappingCompositorDescription,
+      ),
+      (
+        value: HdrToneMapping.player,
+        title: t.videoSettings.hdrToneMappingPlayer,
+        subtitle: t.videoSettings.hdrToneMappingPlayerDescription,
+      ),
+    ];
+    final primary = Theme.of(context).colorScheme.primary;
+
+    return ListView(
+      children: [
+        for (final mode in modes)
+          FocusableListTile(
+            title: Text(mode.title, style: TextStyle(color: _hdrToneMapping == mode.value ? primary : null)),
+            subtitle: Text(mode.subtitle, style: TextStyle(color: tokens(context).textMuted, fontSize: 12)),
+            trailing: _hdrToneMapping == mode.value
+                ? AppIcon(Symbols.check_rounded, fill: 1, color: primary)
+                : null,
+            onTap: () => _setHdrToneMapping(mode.value),
           ),
       ],
     );
@@ -1147,6 +1235,8 @@ class _VideoSettingsSheetState extends State<VideoSettingsSheet> {
             return _buildShaderView();
           case _SettingsView.dvConversion:
             return _buildDvConversionView();
+          case _SettingsView.hdrToneMapping:
+            return _buildHdrToneMappingView();
         }
       }(),
     );

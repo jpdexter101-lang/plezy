@@ -1014,4 +1014,21 @@ class PlayerNative extends PlayerBase {
     if (_nativeCoreUnavailable || !Platform.isAndroid || !initialized) return;
     await invoke('abandonAudioFocus');
   }
+
+  /// Whether this player can actually put HDR on screen right now.
+  ///
+  /// Only Linux answers dynamically, and there it genuinely varies: the native
+  /// side requires a 10-bit plane, a compositor that advertises the source's
+  /// transfer function and BT.2020, and an output the compositor reports as
+  /// being in HDR. Moving the window to an SDR monitor changes the answer, so
+  /// this is a query and never cached.
+  ///
+  /// Elsewhere the capability is a property of the platform, so the static
+  /// answer is the right one and no channel round trip is made.
+  Future<bool> isHdrOutputSupported() async {
+    if (_nativeCoreUnavailable) return false;
+    if (!Platform.isLinux) return Platform.isIOS || Platform.isMacOS || Platform.isWindows;
+    if (audioOnly) return false;
+    return await invoke<bool>('isHDRSupported') ?? false;
+  }
 }

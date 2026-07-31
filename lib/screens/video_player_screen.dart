@@ -1200,10 +1200,31 @@ class VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindin
         await currentPlayer.setAudioPassthrough(settingsService.read(SettingsService.audioPassthrough));
       }
 
-      // HDR is controlled via custom hdr-enabled property on iOS/macOS/Windows
-      if (Platform.isIOS || Platform.isMacOS || Platform.isWindows) {
+      // Linux only, and set before hdr-enabled so the first image description is
+      // already built for the chosen mode.
+      if (Platform.isLinux) {
+        final toneMapping = settingsService.read(SettingsService.hdrToneMapping);
+        try {
+          await currentPlayer.setProperty('hdr-tone-mapping', toneMapping.name);
+        } catch (e) {
+          appLogger.d('VideoPlayerScreen: HDR tone-mapping mode not applied', error: e);
+        }
+      }
+
+      // HDR is controlled via the custom hdr-enabled property. On Linux it means
+      // "allow passthrough": the native side only describes the plane as HDR
+      // when the compositor, the output and the source all agree, so pushing the
+      // preference here is safe even when it cannot be honoured. It rejects the
+      // call outright when the output is not in HDR, which is not an error worth
+      // failing playback over.
+      if (Platform.isIOS || Platform.isMacOS || Platform.isWindows || Platform.isLinux) {
         final enableHDR = settingsService.read(SettingsService.enableHDR);
-        await currentPlayer.setProperty('hdr-enabled', enableHDR ? 'yes' : 'no');
+        try {
+          await currentPlayer.setProperty('hdr-enabled', enableHDR ? 'yes' : 'no');
+        } on PlatformException catch (e) {
+          if (e.code != 'HDR_UNSUPPORTED') rethrow;
+          appLogger.d('VideoPlayerScreen: HDR passthrough unavailable on this output');
+        }
       }
 
       final audioSyncOffset = settingsService.read(SettingsService.audioSyncOffset);

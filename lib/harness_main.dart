@@ -15,7 +15,6 @@ import 'package:flutter/scheduler.dart';
 
 import 'mpv/models.dart';
 import 'mpv/player/player.dart';
-import 'mpv/player/player_base.dart';
 import 'mpv/video.dart';
 
 void main() {
@@ -127,6 +126,23 @@ class _HarnessAppState extends State<_HarnessApp> {
       if (level != null && level.isNotEmpty) {
         await player.setLogLevel(level);
         stdout.writeln('HARNESS_MPV_LOG $level');
+      }
+      // Selected before hdr-enabled so the first description built already uses
+      // the requested mode; the native side re-applies either way.
+      //
+      // A rejected value aborts instead of carrying on. This harness exists to
+      // produce A/B photographs, and continuing in whatever mode happened to be
+      // active would label the result with a leg that was never shown.
+      final toneMapping = Platform.environment['PLEZY_HARNESS_TONEMAP'];
+      if (toneMapping != null && toneMapping.isNotEmpty) {
+        try {
+          await player.setProperty('hdr-tone-mapping', toneMapping);
+          stdout.writeln('HARNESS_TONEMAP $toneMapping');
+        } catch (e) {
+          stdout.writeln('HARNESS_TONEMAP_ERROR $e');
+          setState(() => _status = 'bad PLEZY_HARNESS_TONEMAP: $toneMapping');
+          return;
+        }
       }
       if (Platform.environment['PLEZY_HARNESS_HDR'] == '1') {
         try {
