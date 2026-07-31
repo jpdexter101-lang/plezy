@@ -1,6 +1,8 @@
 #include "mpv_plugin.h"
 
 #include <cstring>
+#include <deque>
+#include <functional>
 #include <new>
 
 #include "mpv_texture.h"
@@ -9,6 +11,15 @@
 enum class VideoBootstrapState { kIdle, kPending, kReady, kFailed };
 using PlayerPtr = std::unique_ptr<mpv::MpvPlayer>;
 using VideoSurfacePtr = std::unique_ptr<mpv::WaylandVideoSurface>;
+
+// One queued HDR transaction: what to apply, and who to tell when it settles.
+struct PendingHdrRequest {
+  bool allow = false;
+  mpv::HdrToneMapping mode = mpv::HdrToneMapping::kCompositor;
+  std::function<void(int)> done;
+};
+
+using HdrQueue = std::deque<PendingHdrRequest>;
 
 struct _MpvPlugin {
   GObject parent_instance;
@@ -33,10 +44,51 @@ struct _MpvPlugin {
   gboolean visible;
   gboolean initialized;
   gboolean audio_only;
+  // What Dart last asked for via hdr-enabled. Remembered because the answer can
+  // change without Dart saying anything: moving the window to another monitor
+  // changes whether the output is in HDR at all, and the plane has to be
+  // re-described when it does.
+  gboolean hdr_wanted;
   VideoBootstrapState bootstrap_state;
   gchar* bootstrap_error;
   FlMethodCall* ready_call;
   guint64 generation;
+  // Who tone-maps when HDR is on. Defaults to the compositor, which is the
+  // behaviour that shipped first and needs no knowledge of the display; the
+  // player-side path is opted into.
+  //
+  // Two fields, deliberately. `hdr_tone_mapping` is the mode mpv last *accepted*;
+  // `hdr_tone_mapping_desired` is what the app last asked for. Requests are
+  // applied strictly in order, so an internal re-apply (playback restart,
+  // preferred-description change) queued behind a user's mode change must carry
+  // the desired mode - reading the committed one would send the stale mode last
+  // and make it final.
+  mpv::HdrToneMapping hdr_tone_mapping = mpv::HdrToneMapping::kCompositor;
+  mpv::HdrToneMapping hdr_tone_mapping_desired = mpv::HdrToneMapping::kCompositor;
+  // Bumped per user mode request, so a failure only reverts `desired` when no
+  // newer request has already replaced it.
+  uint64_t hdr_mode_request_serial = 0;
+  // Exactly one HDR transaction runs at a time, end to end.
+  //
+  // A transaction spans staging and validating the image description, switching
+  // mpv's output colour space, and committing both. Interleaving two cannot be
+  // made consistent after the fact: a superseded transaction may already have
+  // moved mpv, so refusing its commit leaves mpv on one curve and the surface
+  // describing another. Serializing the whole thing is what makes that
+  // unreachable, rather than something to detect and unwind.
+  bool hdr_transaction_in_flight = false;
+  // Waiting user requests, in order. Each keeps its own callback because each has
+  // a Dart method call to answer, and answering one with another's outcome is the
+  // same divergence one level up.
+  HdrQueue hdr_queue;
+  // Internal re-applies coalesce into a flag instead of queueing: they have no
+  // caller to answer, playback-restart fires on every seek, and each transaction
+  // re-reads the source when its turn comes, so collapsing several loses nothing.
+  bool hdr_reapply_pending = false;
+  // The peak mpv was last told to tone-map to, 0 meaning "do not". Compared
+  // against the display's current peak so a move between two HDR outputs is not
+  // mistaken for no change at all.
+  uint32_t applied_target_peak = 0;
   guint ready_timeout_source_id;
 };
 
@@ -46,20 +98,29 @@ G_DEFINE_TYPE(MpvPlugin, mpv_plugin, G_TYPE_OBJECT)
 static void mpv_plugin_handle_method_call(FlMethodChannel* channel, FlMethodCall* method_call, gpointer user_data);
 
 static mpv::HdrMetadata read_source_hdr_metadata(MpvPlugin* self);
+static void apply_hdr_state(MpvPlugin* self, bool allow, mpv::HdrToneMapping mode, std::function<void(int)> done);
+static void request_hdr_reapply(MpvPlugin* self);
+static void run_next_hdr_transaction(MpvPlugin* self);
+static void submit_hdr_transaction(
+    MpvPlugin* self, bool allow, mpv::HdrToneMapping mode, std::function<void(int)> done);
 
 // Events reach Dart unchanged; this only watches them go past. A playback
-// restart is the first moment the source's HDR metadata is knowable, and HDR
-// is normally switched on well before that - typically before any file is
-// open - so the image description built back then has to be revisited.
-// Refreshing is cheap and self-cancelling when nothing changed, which matters
-// because this also fires on every seek.
+// restart is the first moment the source's colour space and HDR metadata are
+// knowable, and HDR is normally permitted well before that - typically before
+// any file is open - so the decision made back then has to be revisited.
+//
+// It goes through the full apply path rather than only refreshing the
+// description, because a new file can change the *curve*: PQ to HLG, or HDR to
+// SDR entirely, each of which mpv has to be reconfigured for and not just
+// re-described. Self-cancelling when nothing changed, which matters because this
+// also fires on every seek.
 static void observe_event_for_hdr(MpvPlugin* self, FlValue* event) {
-  if (!self->video_surface || !self->video_surface->hdr_requested()) return;
+  if (!self->video_surface) return;
   if (event == nullptr || fl_value_get_type(event) != FL_VALUE_TYPE_MAP) return;
   FlValue* name = fl_value_lookup_string(event, "name");
   if (name == nullptr || fl_value_get_type(name) != FL_VALUE_TYPE_STRING) return;
   if (g_strcmp0(fl_value_get_string(name), "playback-restart") != 0) return;
-  self->video_surface->RefreshHdrMetadata(read_source_hdr_metadata(self));
+  request_hdr_reapply(self);
 }
 
 static void send_event(MpvPlugin* self, FlValue* event) {
@@ -91,6 +152,16 @@ static void complete_ready_call(MpvPlugin* self, gboolean success, const char* m
 
 static void release_video_resources(MpvPlugin* self) {
   ++self->generation;
+  // Queued transactions will never run, and each may be holding a reference to a
+  // Dart method call that has to be answered or it is leaked along with its
+  // response.
+  auto queued = std::move(self->hdr_queue);
+  self->hdr_queue.clear();
+  self->hdr_transaction_in_flight = false;
+  self->hdr_reapply_pending = false;
+  for (auto& request : queued) {
+    if (request.done) request.done(MPV_ERROR_UNINITIALIZED);
+  }
   if (self->player) {
     // The texture is a raw callback target. Revoke both callback paths before
     // unregistering or unreferencing it; Dispose then drains any callback
@@ -134,6 +205,10 @@ static void render_video_plane(MpvPlugin* self, gboolean force) {
   if (force) self->plane_needs_render = TRUE;
   if (!self->player || !self->video_surface || !self->video_surface->valid()) return;
   if (!self->video_surface->visible() || !self->video_surface->has_size()) return;
+  // Present() is held while a colour transition is staged, so a render now would
+  // be discarded. The forced render after CommitHdrTransition is what resumes;
+  // plane_needs_render stays set meanwhile, so nothing is lost.
+  if (self->video_surface->hdr_transition_staged()) return;
   // Skip entirely while the compositor has not acknowledged the last frame:
   // an occluded plane is never acknowledged, and rendering into it anyway
   // would burn GPU work on frames that can never be shown.
@@ -144,27 +219,39 @@ static void render_video_plane(MpvPlugin* self, gboolean force) {
   // mpv's redraw latch is what says a new frame actually exists.
   if (!self->plane_needs_render && !self->player->NeedsRedraw()) return;
   if (self->player->RenderToSurface(
-          self->video_surface->egl_surface(), self->video_surface->width(),
-          self->video_surface->height())) {
+          self->video_surface->egl_surface(), self->video_surface->width(), self->video_surface->height())) {
     self->plane_needs_render = FALSE;
     self->video_surface->Present();
   }
 }
 
-// Collects the source's HDR10 static metadata for the compositor. Without it
-// the compositor can only assume the worst case the PQ curve permits - 10000
-// nits - and rolls the highlights off much harder than the content needs.
+// Collects what the source actually is, plus its HDR10 static metadata.
 //
-// The protocol carries these as whole nits, and a value that rounds to zero
+// Both halves matter. The colour space decides whether the plane may be
+// described as HDR at all — describing it because a setting is on, rather than
+// because the stream carries an HDR curve, asks the compositor to undo a
+// transform nobody applied. The luminances then decide how hard the compositor
+// tone-maps: without them it must assume the worst case PQ permits, 10000 nits,
+// and rolls highlights off far harder than the content needs.
+//
+// The protocol carries luminances as whole nits, and a value that rounds to zero
 // would read as "not stated", so anything positive is kept at a minimum of 1.
 static mpv::HdrMetadata read_source_hdr_metadata(MpvPlugin* self) {
   mpv::HdrMetadata metadata;
   if (!self->player) return metadata;
   mpv::MpvPlayer::SourceHdrMetadata source;
-  if (!self->player->ReadSourceHdrMetadata(&source)) {
-    g_message("MPV video plane: source carries no HDR10 metadata; compositor will use its defaults");
-    return metadata;
+  if (!self->player->ReadSourceHdrMetadata(&source)) return metadata;
+
+  // mpv's own trc / primaries names, from video/csputils.c's tables.
+  if (source.transfer == "pq") {
+    metadata.transfer = mpv::SourceTransfer::kPq;
+  } else if (source.transfer == "hlg") {
+    metadata.transfer = mpv::SourceTransfer::kHlg;
   }
+  if (source.primaries == "bt.2020") {
+    metadata.primaries = mpv::SourcePrimaries::kBt2020;
+  }
+
   auto nits = [](double value) -> uint32_t {
     if (!(value > 0.0)) return 0;
     const double rounded = value + 0.5;
@@ -176,9 +263,236 @@ static mpv::HdrMetadata read_source_hdr_metadata(MpvPlugin* self) {
   metadata.max_fall = nits(source.max_fall);
   metadata.max_luminance = nits(source.max_luminance);
   metadata.min_luminance = source.min_luminance;
-  g_message("MPV video plane: source HDR10 metadata MaxCLL=%u MaxFALL=%u mastering=%.4f-%u nits",
-            metadata.max_cll, metadata.max_fall, metadata.min_luminance, metadata.max_luminance);
+  g_message(
+      "MPV video plane: source is %s / %s, MaxCLL=%u MaxFALL=%u mastering=%.4f-%u nits",
+      source.transfer.empty() ? "(no stream)" : source.transfer.c_str(),
+      source.primaries.empty() ? "(no stream)" : source.primaries.c_str(), metadata.max_cll, metadata.max_fall,
+      metadata.min_luminance, metadata.max_luminance);
   return metadata;
+}
+
+// Whether the client and the display could carry HDR at all, before the source
+// is considered. Both halves must agree: this client has to be able to describe
+// an HDR plane, and the output the surface sits on has to actually be in HDR.
+// The second can change under us when the window moves between monitors, which
+// is why nothing caches it.
+static bool hdr_available(MpvPlugin* self) {
+  return self->video_surface != nullptr && self->video_surface->supports_hdr() && self->video_surface->output_is_hdr();
+}
+
+// Applies an HDR state to both halves of the plane, atomically on screen.
+//
+// The surface's colour state and the buffer it describes land on the *same*
+// child-surface commit, and that commit is performed by eglSwapBuffers inside
+// Present(). So neither "pixels first" nor "description first" is atomic on its
+// own: whichever goes second leaves a window in which presented frames carry one
+// colour space while labelled with the other. On enable that window is the
+// compositor's validation round-trip, and PQ frames read as sRGB are a visible
+// flash.
+//
+// The three-step transition closes it:
+//
+//   1. BeginHdrTransition stages and validates the description, holding Present()
+//      so nothing can commit mid-change.
+//   2. Once it settles, mpv's output colour space is switched.
+//   3. CommitHdrTransition attaches the state and releases the hold, and the
+//      plane is rendered and presented immediately - so the first buffer in the
+//      new colour space is the one that carries it.
+//
+// Any failure aborts, leaving both halves exactly as they were.
+//
+// `mode` is the *desired* tone-map owner, passed in rather than read from the
+// plugin, so the committed field is updated only when the request carrying that
+// mode is the one mpv accepted. Requests are applied in order, so the last
+// success is what mpv holds and what gets committed last.
+//
+// The source is read once and the same snapshot drives every step.
+static void apply_hdr_state(MpvPlugin* self, bool allow, mpv::HdrToneMapping mode, std::function<void(int)> done) {
+  if (self->video_surface == nullptr || self->player == nullptr) {
+    if (done) done(MPV_ERROR_UNINITIALIZED);
+    return;
+  }
+  const mpv::HdrMetadata source = read_source_hdr_metadata(self);
+
+  // One gate, in hdr_metadata.h, so the four conditions and the peak clamp are
+  // testable without a compositor.
+  mpv::HdrInputs inputs;
+  inputs.allowed = allow;
+  inputs.client_can_describe = self->video_surface->supports_hdr();
+  inputs.output_is_hdr = self->video_surface->output_is_hdr();
+  inputs.source_describable = self->video_surface->CanDescribeSource(source);
+  inputs.requested = mode;
+  inputs.display_peak_nits = self->video_surface->preferred().max_luminance;
+  const mpv::HdrDecision decision = mpv::DecideHdr(inputs, source);
+
+  // What the buffer will actually contain: the source untouched, or the same
+  // curve and gamut reduced to the peak we are about to declare. DecideHdr
+  // already clamped that peak to the curve's primary colour volume, so mpv aims
+  // at exactly what the compositor is told.
+  const mpv::HdrMetadata described =
+      decision.tone_map_in_player ? mpv::DescribeTonemappedTo(source, decision.target_peak_nits) : source;
+  const mpv::SourceTransfer transfer = decision.describe ? described.transfer : mpv::SourceTransfer::kSdr;
+  const guint64 generation = self->generation;
+
+  self->video_surface->BeginHdrTransition(
+      decision.describe, described, [self, decision, transfer, mode, generation, done](uint64_t token, bool staged) {
+        if (self->generation != generation || self->video_surface == nullptr) {
+          if (done) done(MPV_ERROR_UNINITIALIZED);
+          return;
+        }
+        if (!staged) {
+          self->video_surface->AbortHdrTransition(token);
+          g_warning("MPV video plane: colour transition abandoned; leaving HDR as it was");
+          if (done) done(MPV_ERROR_UNSUPPORTED);
+          return;
+        }
+        self->player->SetHdrOutput(
+            transfer, decision.target_peak_nits,
+            [self, decision, mode, generation, token, done](mpv::MpvPlayer::HdrOutputResult result, int error) {
+              using Result = mpv::MpvPlayer::HdrOutputResult;
+              // The plane may have been torn down while the property was in flight.
+              if (self->generation != generation || self->video_surface == nullptr) {
+                if (done) done(error);
+                return;
+              }
+              switch (result) {
+                case Result::kApplied: {
+                  // Pixels and state now agree; publish them together. Transactions
+                  // are serialized, so the only staged transition can be this one
+                  // and the token is belt and braces: a false return means token
+                  // zero, i.e. nothing needed staging because nothing changed.
+                  const bool committed = self->video_surface->CommitHdrTransition(token);
+                  // An earlier kUnknown hid the plane rather than show pixels it
+                  // could not label. mpv answers again, so the visibility Dart
+                  // actually asked for is restored here - otherwise the quarantine
+                  // would outlive its cause and the video would stay black until
+                  // the next unrelated visibility change.
+                  const bool want_visible = self->visible != FALSE;
+                  const bool unquarantined = want_visible && !self->video_surface->visible();
+                  if (unquarantined) self->video_surface->SetVisible(true);
+                  if (committed || unquarantined) render_video_plane(self, TRUE);
+                  if (committed && decision.describe) {
+                    g_message(
+                        "MPV video plane: HDR on, tone mapping by %s",
+                        decision.tone_map_in_player ? "the player" : "the compositor");
+                  }
+                  self->hdr_tone_mapping = mode;
+                  self->applied_target_peak = decision.target_peak_nits;
+                  break;
+                }
+                case Result::kRestored:
+                  // mpv is back where it was, so the description already committed
+                  // is still true of the pixels and must be left exactly alone.
+                  self->video_surface->AbortHdrTransition(token);
+                  g_warning(
+                      "MPV video plane: mpv refused the %s output colour space and was put back, "
+                      "so the surface description is unchanged: %s",
+                      decision.describe ? "HDR" : "SDR", mpv_error_string(error));
+                  break;
+                case Result::kForcedSdr:
+                  // mpv could not be put back and is now SDR. Any committed HDR
+                  // description describes pixels that no longer exist, so it goes
+                  // too - and immediately, paired with a fresh frame.
+                  if (self->video_surface->ForceUndescribed()) render_video_plane(self, TRUE);
+                  self->applied_target_peak = 0;
+                  g_warning(
+                      "MPV video plane: mpv's colour space could not be restored and was forced to "
+                      "SDR; HDR withdrawn: %s",
+                      mpv_error_string(error));
+                  break;
+                case Result::kUnknown:
+                  // Nothing can be said truthfully about these pixels, so nothing is
+                  // said and nothing is shown. A later transaction can recover.
+                  self->video_surface->ForceUndescribed();
+                  self->video_surface->SetVisible(false);
+                  self->applied_target_peak = 0;
+                  g_warning(
+                      "MPV video plane: mpv's output colour space is no longer commandable; the "
+                      "plane is hidden rather than shown mislabelled: %s",
+                      mpv_error_string(error));
+                  break;
+              }
+              if (done) done(error);
+            });
+      });
+}
+
+// Runs the next queued HDR transaction, or drains the coalesced internal
+// re-apply once the queue empties.
+static void run_next_hdr_transaction(MpvPlugin* self) {
+  if (self->hdr_queue.empty()) {
+    self->hdr_transaction_in_flight = false;
+    if (self->hdr_reapply_pending) {
+      self->hdr_reapply_pending = false;
+      request_hdr_reapply(self);
+    }
+    return;
+  }
+  auto request = std::make_shared<PendingHdrRequest>(std::move(self->hdr_queue.front()));
+  self->hdr_queue.pop_front();
+  self->hdr_transaction_in_flight = true;
+  apply_hdr_state(self, request->allow, request->mode, [self, request](int error) {
+    if (request->done) request->done(error);
+    // Only now, with the surface unstaged and mpv settled, may the next one start.
+    run_next_hdr_transaction(self);
+  });
+}
+
+// Queues a transaction on behalf of a caller that needs its own outcome.
+static void submit_hdr_transaction(
+    MpvPlugin* self, bool allow, mpv::HdrToneMapping mode, std::function<void(int)> done) {
+  if (self->video_surface == nullptr || self->player == nullptr) {
+    if (done) done(MPV_ERROR_UNINITIALIZED);
+    return;
+  }
+  PendingHdrRequest request;
+  request.allow = allow;
+  request.mode = mode;
+  request.done = std::move(done);
+  self->hdr_queue.push_back(std::move(request));
+  if (!self->hdr_transaction_in_flight) run_next_hdr_transaction(self);
+}
+
+// The only entry point for internal re-applies: playback restarts and
+// preferred-description changes. Nobody is waiting on these, so instead of
+// queueing they collapse into a single pending flag and re-read the mode and the
+// source when their turn comes.
+static void request_hdr_reapply(MpvPlugin* self) {
+  if (self->video_surface == nullptr) return;
+  if (self->hdr_transaction_in_flight) {
+    self->hdr_reapply_pending = true;
+    return;
+  }
+  submit_hdr_transaction(self, self->hdr_wanted != FALSE, self->hdr_tone_mapping_desired, nullptr);
+}
+
+// Re-applies the current request when the compositor's preferred description
+// moves - a monitor change, HDR switched on or off under the app, or the output
+// going away entirely.
+static void handle_preferred_changed(MpvPlugin* self) {
+  if (self->video_surface == nullptr) return;
+
+  // Ask the same gate that would run anyway what the answer is now, and only
+  // re-apply when it differs from what is in force. The on/off state alone is not
+  // enough: in player mode the peak we tone-map to *is* the display's peak, so
+  // moving between two HDR outputs of different brightness changes what must be
+  // sent while the boolean stays put.
+  const mpv::HdrMetadata source = read_source_hdr_metadata(self);
+  mpv::HdrInputs inputs;
+  inputs.allowed = self->hdr_wanted != FALSE;
+  inputs.client_can_describe = self->video_surface->supports_hdr();
+  inputs.output_is_hdr = self->video_surface->output_is_hdr();
+  inputs.source_describable = self->video_surface->CanDescribeSource(source);
+  inputs.requested = self->hdr_tone_mapping_desired;
+  inputs.display_peak_nits = self->video_surface->preferred().max_luminance;
+  const mpv::HdrDecision decision = mpv::DecideHdr(inputs, source);
+
+  if (decision.describe == self->video_surface->hdr_active() &&
+      decision.target_peak_nits == self->applied_target_peak) {
+    return;
+  }
+  g_message("MPV video plane: preferred description changed; re-evaluating HDR");
+  request_hdr_reapply(self);
 }
 
 // Attempts the native Wayland video plane. Returns false when it is
@@ -202,7 +516,7 @@ static gboolean try_start_video_plane(MpvPlugin* self, FlView* view) {
     return FALSE;
   }
   if (!self->player->InitRenderContextForSurface(
-          surface->egl_display(), surface->egl_config(), surface->egl_surface())) {
+          surface->egl_display(), surface->egl_config(), surface->egl_surface(), surface->depth_bits())) {
     surface->Destroy();
     g_message("MPV: video-plane render context failed; using the Flutter texture path");
     return FALSE;
@@ -210,6 +524,7 @@ static gboolean try_start_video_plane(MpvPlugin* self, FlView* view) {
 
   self->video_surface = std::move(surface);
   self->video_surface->SetFrameCallback([self]() { render_video_plane(self, FALSE); });
+  self->video_surface->SetPreferredChangedCallback([self]() { handle_preferred_changed(self); });
   self->player->SetRedrawCallback([self]() { render_video_plane(self, FALSE); });
   return TRUE;
 }
@@ -298,8 +613,19 @@ static void mpv_plugin_dispose(GObject* object) {
   G_OBJECT_CLASS(mpv_plugin_parent_class)->dispose(object);
 }
 
+// GObject instances come from g_type_create_instance, which zeroes the memory and
+// runs no C++ constructors, and are released without running destructors. Every
+// non-trivial member therefore has to be placement-constructed here and destroyed
+// in finalize, in reverse.
+//
+// A zeroed std::unique_ptr happens to behave like an empty one, which is why the
+// two smart pointers survived without this; a zeroed std::deque does not - its
+// internal map pointers must be initialised before the first push_back, or it
+// dereferences null.
 static void mpv_plugin_finalize(GObject* object) {
   MpvPlugin* self = MPV_PLUGIN(object);
+  self->hdr_queue.~HdrQueue();
+  self->video_surface.~VideoSurfacePtr();
   self->player.~PlayerPtr();
   G_OBJECT_CLASS(mpv_plugin_parent_class)->finalize(object);
 }
@@ -311,6 +637,8 @@ static void mpv_plugin_class_init(MpvPluginClass* klass) {
 
 static void mpv_plugin_init(MpvPlugin* self) {
   new (&self->player) PlayerPtr();
+  new (&self->video_surface) VideoSurfacePtr();
+  new (&self->hdr_queue) HdrQueue();
   self->visible = FALSE;
   self->initialized = FALSE;
   self->texture = nullptr;
@@ -512,20 +840,73 @@ static void mpv_plugin_handle_method_call(FlMethodChannel* channel, FlMethodCall
         response = FL_METHOD_RESPONSE(fl_method_error_response_new("INVALID_ARGS", "Missing 'name'", nullptr));
       } else if (value_value == nullptr || fl_value_get_type(value_value) != FL_VALUE_TYPE_STRING) {
         response = FL_METHOD_RESPONSE(fl_method_error_response_new("INVALID_ARGS", "Missing 'value'", nullptr));
-      } else if (
-          self->video_surface && g_strcmp0(fl_value_get_string(name_value), "hdr-enabled") == 0) {
+      } else if (self->video_surface && g_strcmp0(fl_value_get_string(name_value), "hdr-tone-mapping") == 0) {
+        // Not an mpv property: it selects which side reduces the source's range,
+        // which changes both mpv's target-peak and the luminances the compositor
+        // is told. Re-applied immediately so the switch is visible without a
+        // seek.
+        //
+        // Unknown values are rejected rather than folded into the default. This
+        // knob's whole purpose is A/B comparison, and silently answering a typo
+        // with "compositor, success" would mislabel the very measurement it
+        // exists to produce.
+        const char* mode = fl_value_get_string(value_value);
+        const bool is_player = g_strcmp0(mode, "player") == 0;
+        const bool is_compositor = g_strcmp0(mode, "compositor") == 0;
+        if (!is_player && !is_compositor) {
+          response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+              "INVALID_ARGS", "hdr-tone-mapping must be 'compositor' or 'player'", nullptr));
+        } else {
+          const mpv::HdrToneMapping requested =
+              is_player ? mpv::HdrToneMapping::kPlayer : mpv::HdrToneMapping::kCompositor;
+          // A no-op answer is only honest once the mode has actually settled. If a
+          // change is queued or running, `desired` holds a value mpv has not yet
+          // accepted, and answering a duplicate with immediate success would have
+          // Dart persist a mode the original request may still revert. Such a
+          // duplicate is queued instead and gets a real outcome; the extra
+          // property writes are idempotent.
+          if (requested != self->hdr_tone_mapping || self->hdr_transaction_in_flight || !self->hdr_queue.empty()) {
+            // `desired` moves now, so an internal re-apply that runs later carries
+            // the new mode. `hdr_tone_mapping` itself is committed by the
+            // transaction only if mpv accepts the change, which is what keeps
+            // native and Dart - which does not persist on failure - in agreement.
+            self->hdr_tone_mapping_desired = requested;
+            const uint64_t serial = ++self->hdr_mode_request_serial;
+            g_object_ref(method_call);
+            submit_hdr_transaction(self, self->hdr_wanted != FALSE, requested, [self, method_call, serial](int error) {
+              g_autoptr(FlMethodResponse) async_response = nullptr;
+              if (plezy::mpv_common::SetPropertyStatusSucceeded(error)) {
+                async_response = FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
+              } else {
+                // Hand the desire back to whatever is actually in force, read
+                // live rather than captured: an intervening request may have
+                // committed since. Skipped if a newer request already claimed
+                // the desire.
+                if (self->hdr_mode_request_serial == serial) {
+                  self->hdr_tone_mapping_desired = self->hdr_tone_mapping;
+                }
+                async_response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+                    plezy::mpv_common::kSetPropertyFailedCode, mpv_error_string(error), nullptr));
+              }
+              fl_method_call_respond(method_call, async_response, nullptr);
+              g_object_unref(method_call);
+            });
+            return;
+          }
+          response = FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
+        }
+      } else if (self->video_surface && g_strcmp0(fl_value_get_string(name_value), "hdr-enabled") == 0) {
         // HDR spans both halves of the plane: mpv has to emit PQ / BT.2020, and
         // the compositor has to be told that is what the buffer holds. Neither
         // alone produces HDR, so this cannot go through the plain property path.
-        const bool enabled =
-            plezy::mpv_common::ParseEnabledFlag(fl_value_get_string(value_value));
-        if (!self->video_surface->supports_hdr() && enabled) {
+        const bool enabled = plezy::mpv_common::ParseEnabledFlag(fl_value_get_string(value_value));
+        self->hdr_wanted = enabled ? TRUE : FALSE;
+        if (!hdr_available(self) && enabled) {
           response = FL_METHOD_RESPONSE(fl_method_error_response_new(
-              "HDR_UNSUPPORTED", "This compositor or video plane cannot carry HDR", nullptr));
+              "HDR_UNSUPPORTED", "This compositor, video plane or output cannot carry HDR", nullptr));
         } else {
-          self->video_surface->SetHdr(enabled, read_source_hdr_metadata(self));
           g_object_ref(method_call);
-          self->player->SetHdrOutput(enabled, [method_call](int error) {
+          submit_hdr_transaction(self, enabled, self->hdr_tone_mapping_desired, [method_call](int error) {
             g_autoptr(FlMethodResponse) async_response = nullptr;
             if (plezy::mpv_common::SetPropertyStatusSucceeded(error)) {
               async_response = FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
@@ -638,10 +1019,17 @@ static void mpv_plugin_handle_method_call(FlMethodChannel* channel, FlMethodCall
       response = FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
     }
   } else if (strcmp(method, "isHDRSupported") == 0) {
-    // Reports whether the *plane* can be described as HDR, not whether the
-    // display is in HDR mode. On an SDR output the compositor tone-maps the
-    // PQ plane, which is still preferable to mpv guessing at the display.
-    const gboolean supported = self->video_surface && self->video_surface->supports_hdr();
+    // Two independent conditions, and both must hold. supports_hdr() is about
+    // this client: a 10-bit plane, a colour-managed surface, and a compositor
+    // that advertises PQ / BT.2020. output_is_hdr() is about the display: the
+    // compositor's preferred description for the surface is PQ, which is only
+    // true when the output is genuinely in HDR.
+    //
+    // The second is what stops the app offering an HDR toggle on an SDR panel,
+    // where enabling it only invites the compositor to tone-map a plane that
+    // never needed to be PQ in the first place.
+    const gboolean supported =
+        self->video_surface && self->video_surface->supports_hdr() && self->video_surface->output_is_hdr();
     response = FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_bool(supported)));
   } else if (strcmp(method, "setVideoRect") == 0) {
     if (!self->video_surface) {
@@ -657,8 +1045,8 @@ static void mpv_plugin_handle_method_call(FlMethodChannel* channel, FlMethodCall
       int64_t left = 0, top = 0, right = 0, bottom = 0;
       if (!read_int("left", &left) || !read_int("top", &top) || !read_int("right", &right) ||
           !read_int("bottom", &bottom)) {
-        response = FL_METHOD_RESPONSE(
-            fl_method_error_response_new("INVALID_ARGS", "Missing video rect bounds", nullptr));
+        response =
+            FL_METHOD_RESPONSE(fl_method_error_response_new("INVALID_ARGS", "Missing video rect bounds", nullptr));
       } else {
         FlValue* dpr_value = fl_value_lookup_string(args, "devicePixelRatio");
         double dpr = 1.0;

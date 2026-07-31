@@ -1,6 +1,7 @@
 #include "wayland_video_surface.h"
 
 #include <gdk/gdkwayland.h>
+#include <unistd.h>
 #include <wayland-client.h>
 #include <wayland-egl.h>
 
@@ -24,14 +25,22 @@ struct RegistryTarget {
   wl_subcompositor* subcompositor = nullptr;
   wp_color_manager_v1* color_manager = nullptr;
   bool parametric = false;
+  bool perceptual = false;
   bool pq = false;
+  bool hlg = false;
   bool bt2020 = false;
   bool mastering = false;
+  bool extended_target_volume = false;
   bool done = false;
 };
 
 void ManagerIntent(void* data, wp_color_manager_v1* manager, uint32_t intent) {
-  (void)data; (void)manager; (void)intent;
+  (void)manager;
+  auto* target = static_cast<RegistryTarget*>(data);
+  // set_image_description raises the render_intent protocol error - fatal, not a
+  // rejected description - for any intent the compositor did not advertise here.
+  // Perceptual is the only one this plane ever asks for.
+  if (intent == WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL) target->perceptual = true;
 }
 void ManagerFeature(void* data, wp_color_manager_v1* manager, uint32_t feature) {
   (void)manager;
@@ -43,11 +52,21 @@ void ManagerFeature(void* data, wp_color_manager_v1* manager, uint32_t feature) 
   if (feature == WP_COLOR_MANAGER_V1_FEATURE_SET_MASTERING_DISPLAY_PRIMARIES) {
     target->mastering = true;
   }
+  // Whether a mastering display *larger* than the curve's primary colour volume
+  // may be described. Without it the mastering advertisement only promises
+  // volumes fully contained within it, and exceeding it is implementation
+  // defined. This is what bounds HLG, whose primary volume stops at 1000 nits.
+  if (feature == WP_COLOR_MANAGER_V1_FEATURE_EXTENDED_TARGET_VOLUME) {
+    target->extended_target_volume = true;
+  }
 }
 void ManagerTransferFunction(void* data, wp_color_manager_v1* manager, uint32_t tf) {
   (void)manager;
   auto* target = static_cast<RegistryTarget*>(data);
+  // Both HDR curves are tracked: which one a plane needs is decided per source,
+  // since HLG content must be described as HLG and never re-labelled PQ.
   if (tf == WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ) target->pq = true;
+  if (tf == WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_HLG) target->hlg = true;
 }
 void ManagerPrimaries(void* data, wp_color_manager_v1* manager, uint32_t primaries) {
   (void)manager;
@@ -59,6 +78,12 @@ void ManagerDone(void* data, wp_color_manager_v1* manager) {
   static_cast<RegistryTarget*>(data)->done = true;
 }
 
+// Same completeness requirement as kDescriptionListener below: all five events
+// exist at interface version 1, and a re-vendored XML that adds a sixth must
+// break the build rather than leave a null in the dispatch table.
+static_assert(
+    sizeof(wp_color_manager_v1_listener) == 5 * sizeof(void (*)()),
+    "wp_color_manager_v1_listener gained an event; handle it here");
 const wp_color_manager_v1_listener kManagerListener = {
     ManagerIntent, ManagerFeature, ManagerTransferFunction, ManagerPrimaries, ManagerDone,
 };
@@ -147,18 +172,30 @@ bool WaylandVideoSurface::BindGlobals(GdkDisplay* display, std::string* error) {
   if (target.color_manager != nullptr) {
     wl_proxy_set_queue(reinterpret_cast<wl_proxy*>(target.color_manager), nullptr);
     color_manager_ = target.color_manager;
-    // All three are required to describe a plane as HDR10. Anything less and
-    // the plane simply stays sRGB and mpv keeps tone-mapping as it does today.
-    supports_hdr_ = target.done && target.parametric && target.pq && target.bt2020;
-    // Optional on top: without it the plane is still described as PQ / BT.2020,
-    // the compositor just has to tone-map against its own assumptions rather
-    // than the source's mastering display.
-    supports_mastering_ = target.mastering;
+    supports_pq_ = target.pq;
+    supports_hlg_ = target.hlg;
+    supports_bt2020_ = target.bt2020;
+    // BT.2020, at least one HDR curve, a parametric creator, and the perceptual
+    // rendering intent. Either curve will do here; which one a given source needs
+    // is checked per source. The intent belongs in this gate rather than at
+    // attachment time because set_image_description raises a fatal protocol
+    // error for an unadvertised intent, and perceptual is the only one the plane
+    // ever asks for. Anything missing and the plane stays sRGB with mpv
+    // tone-mapping as it does today.
+    supports_hdr_ = target.done && target.parametric && target.perceptual && target.bt2020 && (target.pq || target.hlg);
+    // Optional on top: without mastering the plane is still described by its
+    // curve and gamut, the compositor just has to tone-map against its own
+    // assumptions rather than the source's mastering display. The interface
+    // version is recorded because version 1 imposes luminance rules version 2
+    // dropped.
+    luminance_support_.mastering = target.mastering;
+    luminance_support_.extended_target_volume = target.extended_target_volume;
+    luminance_support_.interface_version = wp_color_manager_v1_get_version(color_manager_);
     if (!supports_hdr_) {
       g_message(
           "MPV video plane: compositor colour management is incomplete "
-          "(parametric=%d pq=%d bt2020=%d); HDR passthrough unavailable",
-          target.parametric, target.pq, target.bt2020);
+          "(parametric=%d perceptual=%d pq=%d hlg=%d bt2020=%d); HDR passthrough unavailable",
+          target.parametric, target.perceptual, target.pq, target.hlg, target.bt2020);
     }
   }
   return true;
@@ -183,10 +220,8 @@ bool WaylandVideoSurface::InitEgl(std::string* error) {
   for (const int depth : {10, 8}) {
     for (const EGLint renderable : {EGL_OPENGL_ES3_BIT, EGL_OPENGL_ES2_BIT}) {
       const EGLint attributes[] = {
-          EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, renderable,
-          EGL_RED_SIZE,     depth,          EGL_GREEN_SIZE,      depth,
-          EGL_BLUE_SIZE,    depth,          EGL_ALPHA_SIZE,      0,
-          EGL_NONE,
+          EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, renderable, EGL_RED_SIZE, depth, EGL_GREEN_SIZE, depth,
+          EGL_BLUE_SIZE,    depth,          EGL_ALPHA_SIZE,      0,          EGL_NONE,
       };
       EGLConfig config = nullptr;
       EGLint count = 0;
@@ -245,8 +280,8 @@ bool WaylandVideoSurface::Create(GtkWidget* view, std::string* error) {
     return Fail(error, "Failed to create the video wl_egl_window");
   }
 
-  egl_surface_ = eglCreateWindowSurface(
-      egl_display_, egl_config_, reinterpret_cast<EGLNativeWindowType>(egl_window_), nullptr);
+  egl_surface_ =
+      eglCreateWindowSurface(egl_display_, egl_config_, reinterpret_cast<EGLNativeWindowType>(egl_window_), nullptr);
   if (egl_surface_ == EGL_NO_SURFACE) {
     Destroy();
     return Fail(error, "Failed to create the video EGL surface");
@@ -263,146 +298,549 @@ bool WaylandVideoSurface::Create(GtkWidget* view, std::string* error) {
   // HDR is only offered when the plane actually got a 10-bit config.
   if (supports_hdr_ && (color_surface_ == nullptr || depth_bits_ < 10)) {
     supports_hdr_ = false;
-    g_message("MPV video plane: HDR unavailable (colour surface=%p, depth=%d bits)",
-              static_cast<void*>(color_surface_), depth_bits_);
+    g_message(
+        "MPV video plane: HDR unavailable (colour surface=%p, depth=%d bits)", static_cast<void*>(color_surface_),
+        depth_bits_);
   }
-  g_message("MPV video plane: %d bits per channel, HDR %s", depth_bits_,
-            supports_hdr_ ? "available" : "unavailable");
+  g_message("MPV video plane: %d bits per channel, HDR %s", depth_bits_, supports_hdr_ ? "available" : "unavailable");
+
+  // Feedback tells us what the compositor would prefer for this surface, which
+  // is the only channel that reveals the output's real peak luminance and
+  // whether it is in HDR at all. Bootstrapped synchronously on a private queue
+  // so callers - including Dart's isHDRSupported - see a populated answer as
+  // soon as Create returns, then handed to the default queue that GDK drives so
+  // later preferred_changed events keep arriving.
+  if (supports_hdr_) {
+    static_assert(
+        sizeof(wp_color_management_surface_feedback_v1_listener) == 2 * sizeof(void (*)()),
+        "wp_color_management_surface_feedback_v1_listener gained an event");
+    static const wp_color_management_surface_feedback_v1_listener kFeedbackListener = {
+        HandlePreferredChanged,
+        HandlePreferredChanged2,
+    };
+    wl_event_queue* queue = wl_display_create_queue(wl_display_);
+    color_feedback_ = wp_color_manager_v1_get_surface_feedback(color_manager_, surface_);
+    if (color_feedback_ != nullptr) {
+      wp_color_management_surface_feedback_v1_add_listener(color_feedback_, &kFeedbackListener, this);
+      if (queue != nullptr) {
+        // Children inherit the parent proxy's queue at creation, so putting the
+        // feedback object here also lands the description and info objects on
+        // this queue for the duration of the bootstrap.
+        wl_proxy_set_queue(reinterpret_cast<wl_proxy*>(color_feedback_), queue);
+        BeginPreferredQuery();
+        // ready, then get_information's burst, then done: a handful of
+        // roundtrips at worst, and a compositor that never answers just leaves
+        // preferred_ invalid.
+        for (int attempt = 0; attempt < 4 && !preferred_.valid; ++attempt) {
+          if (wl_display_roundtrip_queue(wl_display_, queue) < 0) break;
+        }
+        // The description and info proxies must not outlive the queue they were
+        // created on. A completed query already destroyed them; an incomplete
+        // one is abandoned here and retried below on the default queue.
+        ClearPreferredQuery();
+        wl_proxy_set_queue(reinterpret_cast<wl_proxy*>(color_feedback_), nullptr);
+        if (!preferred_.valid) BeginPreferredQuery();
+      } else {
+        BeginPreferredQuery();
+      }
+    }
+    if (queue != nullptr) wl_event_queue_destroy(queue);
+    g_message("MPV video plane: output is %s", output_is_hdr() ? "in HDR" : "SDR or unknown");
+  }
 
   RequestParentCommit();
   return true;
 }
 
-void WaylandVideoSurface::ClearImageDescription() {
-  if (image_description_ != nullptr) {
-    wp_image_description_v1_destroy(image_description_);
-    image_description_ = nullptr;
+void WaylandVideoSurface::ClearPreferredQuery() {
+  if (preferred_info_ != nullptr) {
+    wp_image_description_info_v1_destroy(preferred_info_);
+    preferred_info_ = nullptr;
+  }
+  if (preferred_description_ != nullptr) {
+    wp_image_description_v1_destroy(preferred_description_);
+    preferred_description_ = nullptr;
   }
 }
 
-void WaylandVideoSurface::HandleImageDescriptionReady(
-    void* data, wp_image_description_v1* desc, uint32_t identity) {
+void WaylandVideoSurface::BeginPreferredQuery() {
+  if (color_feedback_ == nullptr) return;
+  // The protocol asks clients to stop using descriptions from earlier
+  // invocations, so a query in flight is abandoned rather than raced.
+  ClearPreferredQuery();
+  pending_preferred_ = PreferredColorDescription();
+
+  static_assert(
+      sizeof(wp_image_description_v1_listener) == 3 * sizeof(void (*)()),
+      "wp_image_description_v1_listener gained an event; handle it here");
+  static const wp_image_description_v1_listener kPreferredListener = {
+      HandlePreferredFailed,
+      HandlePreferredReady,
+      HandlePreferredReady2,
+  };
+  // get_preferred_parametric rather than get_preferred: we can only read
+  // parameters, and an ICC-based preferred description would tell us nothing.
+  // It is gated on the parametric feature, which supports_hdr_ already implies.
+  preferred_description_ = wp_color_management_surface_feedback_v1_get_preferred_parametric(color_feedback_);
+  if (preferred_description_ == nullptr) return;
+  wp_image_description_v1_add_listener(preferred_description_, &kPreferredListener, this);
+}
+
+void WaylandVideoSurface::CommitPreferredQuery() {
+  pending_preferred_.valid = true;
+  const bool changed = preferred_.valid != pending_preferred_.valid || preferred_.pq != pending_preferred_.pq ||
+                       preferred_.bt2020 != pending_preferred_.bt2020 ||
+                       preferred_.max_luminance != pending_preferred_.max_luminance ||
+                       preferred_.min_luminance_scaled != pending_preferred_.min_luminance_scaled ||
+                       preferred_.reference_luminance != pending_preferred_.reference_luminance;
+  preferred_ = pending_preferred_;
+  ClearPreferredQuery();
+  g_message(
+      "MPV video plane: compositor prefers %s / %s, target %u nits (floor %.4f), reference %u nits",
+      preferred_.pq ? "PQ" : "non-PQ", preferred_.bt2020 ? "BT.2020" : "non-BT.2020", preferred_.max_luminance,
+      static_cast<double>(preferred_.min_luminance_scaled) / kMinLuminanceScale, preferred_.reference_luminance);
+  if (changed && on_preferred_changed_) on_preferred_changed_();
+}
+
+void WaylandVideoSurface::HandlePreferredChanged(
+    void* data, wp_color_management_surface_feedback_v1* feedback, uint32_t identity) {
+  (void)feedback;
+  (void)identity;
+  // The identity is only useful for skipping the re-query when it matches what
+  // we already hold. We do not cache by identity, so always re-read.
+  static_cast<WaylandVideoSurface*>(data)->BeginPreferredQuery();
+}
+
+void WaylandVideoSurface::HandlePreferredChanged2(
+    void* data, wp_color_management_surface_feedback_v1* feedback, uint32_t identity_hi, uint32_t identity_lo) {
+  (void)feedback;
+  (void)identity_hi;
+  (void)identity_lo;
+  static_cast<WaylandVideoSurface*>(data)->BeginPreferredQuery();
+}
+
+void WaylandVideoSurface::HandlePreferredReady(void* data, wp_image_description_v1* desc, uint32_t identity) {
   (void)identity;
   auto* self = static_cast<WaylandVideoSurface*>(data);
-  if (self->image_description_ != desc || self->color_surface_ == nullptr) return;
-  if (!self->hdr_requested_) return;
+  if (self->preferred_description_ != desc) return;
+  // get_information is allowed on descriptions from get_preferred, unlike the
+  // ones we build ourselves, and is the only way to read the parameters out.
+  self->preferred_info_ = wp_image_description_v1_get_information(desc);
+  if (self->preferred_info_ == nullptr) return;
+  wp_image_description_info_v1_add_listener(self->preferred_info_, &InfoListener(), self);
+}
 
-  wp_color_management_surface_v1_set_image_description(
-      self->color_surface_, desc, WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL);
-  self->hdr_active_ = true;
-  g_message("MPV video plane: PQ / BT.2020 image description attached");
-  // Surface state is double-buffered; it lands on the next commit.
-  self->RequestParentCommit();
+void WaylandVideoSurface::HandlePreferredReady2(
+    void* data, wp_image_description_v1* desc, uint32_t identity_hi, uint32_t identity_lo) {
+  (void)identity_hi;
+  (void)identity_lo;
+  HandlePreferredReady(data, desc, 0);
+}
+
+void WaylandVideoSurface::HandlePreferredFailed(
+    void* data, wp_image_description_v1* desc, uint32_t cause, const char* message) {
+  (void)desc;
+  auto* self = static_cast<WaylandVideoSurface*>(data);
+  // low_version means our vendored protocol is too old to be told the whole
+  // description; no_output means the surface is not on one any more. Neither is
+  // fatal - it only means we cannot claim to know the output's peak.
+  g_message(
+      "MPV video plane: no preferred colour description (cause %u): %s", cause, message ? message : "no reason given");
+  const bool had_preference = self->preferred_.valid;
+  self->ClearPreferredQuery();
+  self->preferred_ = PreferredColorDescription();
+  // Losing a preference we previously held is a state change like any other, and
+  // a more urgent one: output_is_hdr() is now false, so the plane must stop being
+  // described as HDR rather than keep a description for an output that is gone.
+  // Silent during the initial bootstrap, where nothing was valid and no callback
+  // is installed yet.
+  if (had_preference && self->on_preferred_changed_) self->on_preferred_changed_();
+}
+
+void WaylandVideoSurface::HandleInfoDone(void* data, wp_image_description_info_v1* info) {
+  auto* self = static_cast<WaylandVideoSurface*>(data);
+  if (self->preferred_info_ != info) return;
+  self->CommitPreferredQuery();
+}
+
+void WaylandVideoSurface::HandleInfoTfNamed(void* data, wp_image_description_info_v1* info, uint32_t tf) {
+  (void)info;
+  auto* self = static_cast<WaylandVideoSurface*>(data);
+  self->pending_preferred_.pq = tf == WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ;
+}
+
+void WaylandVideoSurface::HandleInfoPrimariesNamed(void* data, wp_image_description_info_v1* info, uint32_t primaries) {
+  (void)info;
+  auto* self = static_cast<WaylandVideoSurface*>(data);
+  self->pending_preferred_.bt2020 = primaries == WP_COLOR_MANAGER_V1_PRIMARIES_BT2020;
+}
+
+void WaylandVideoSurface::HandleInfoLuminances(
+    void* data, wp_image_description_info_v1* info, uint32_t min_lum, uint32_t max_lum, uint32_t reference_lum) {
+  (void)info;
+  (void)min_lum;
+  (void)max_lum;
+  // These describe the transfer function's own encodable range - for PQ always
+  // 0.005 to 10000 - so only the reference is informative. The panel's actual
+  // peak arrives in target_luminance instead.
+  static_cast<WaylandVideoSurface*>(data)->pending_preferred_.reference_luminance = reference_lum;
+}
+
+void WaylandVideoSurface::HandleInfoTargetLuminance(
+    void* data, wp_image_description_info_v1* info, uint32_t min_lum, uint32_t max_lum) {
+  (void)info;
+  auto* self = static_cast<WaylandVideoSurface*>(data);
+  self->pending_preferred_.min_luminance_scaled = min_lum;
+  self->pending_preferred_.max_luminance = max_lum;
+}
+
+// Events the plane has no use for. Present because a null member in the
+// listener is a crash, not a skipped event.
+void WaylandVideoSurface::HandleInfoIccFile(
+    void* data, wp_image_description_info_v1* info, int32_t icc, uint32_t icc_size) {
+  (void)data;
+  (void)info;
+  (void)icc_size;
+  // The fd is ours once received; leaking it would exhaust the process's fds
+  // over repeated monitor changes.
+  if (icc >= 0) close(icc);
+}
+
+void WaylandVideoSurface::HandleInfoPrimaries(
+    void* data, wp_image_description_info_v1* info, int32_t r_x, int32_t r_y, int32_t g_x, int32_t g_y, int32_t b_x,
+    int32_t b_y, int32_t w_x, int32_t w_y) {
+  (void)data;
+  (void)info;
+  (void)r_x;
+  (void)r_y;
+  (void)g_x;
+  (void)g_y;
+  (void)b_x;
+  (void)b_y;
+  (void)w_x;
+  (void)w_y;
+}
+
+void WaylandVideoSurface::HandleInfoTfPower(void* data, wp_image_description_info_v1* info, uint32_t eexp) {
+  (void)data;
+  (void)info;
+  (void)eexp;
+}
+
+void WaylandVideoSurface::HandleInfoTargetPrimaries(
+    void* data, wp_image_description_info_v1* info, int32_t r_x, int32_t r_y, int32_t g_x, int32_t g_y, int32_t b_x,
+    int32_t b_y, int32_t w_x, int32_t w_y) {
+  (void)data;
+  (void)info;
+  (void)r_x;
+  (void)r_y;
+  (void)g_x;
+  (void)g_y;
+  (void)b_x;
+  (void)b_y;
+  (void)w_x;
+  (void)w_y;
+}
+
+void WaylandVideoSurface::HandleInfoTargetMaxCll(void* data, wp_image_description_info_v1* info, uint32_t max_cll) {
+  (void)data;
+  (void)info;
+  (void)max_cll;
+}
+
+void WaylandVideoSurface::HandleInfoTargetMaxFall(void* data, wp_image_description_info_v1* info, uint32_t max_fall) {
+  (void)data;
+  (void)info;
+  (void)max_fall;
+}
+
+const wp_image_description_info_v1_listener& WaylandVideoSurface::InfoListener() {
+  static_assert(
+      sizeof(wp_image_description_info_v1_listener) == 11 * sizeof(void (*)()),
+      "wp_image_description_info_v1_listener gained an event; handle it here");
+  static const wp_image_description_info_v1_listener kListener = {
+      HandleInfoDone,           HandleInfoIccFile,         HandleInfoPrimaries,
+      HandleInfoPrimariesNamed, HandleInfoTfPower,         HandleInfoTfNamed,
+      HandleInfoLuminances,     HandleInfoTargetPrimaries, HandleInfoTargetLuminance,
+      HandleInfoTargetMaxCll,   HandleInfoTargetMaxFall,
+  };
+  return kListener;
+}
+
+void WaylandVideoSurface::ClearStagedDescription() {
+  if (staged_description_ != nullptr) {
+    wp_image_description_v1_destroy(staged_description_);
+    staged_description_ = nullptr;
+  }
+}
+
+void WaylandVideoSurface::SettleTransition(bool ok) {
+  if (!transition_staged_ || staged_settled_) return;
+  staged_settled_ = true;
+  // Moved out first: the callback is entitled to start the next transition, and
+  // it must not be running out of a member this object may reassign underneath it.
+  auto settled = std::move(on_transition_settled_);
+  on_transition_settled_ = nullptr;
+  if (settled) settled(transition_token_, ok);
+}
+
+void WaylandVideoSurface::HandleImageDescriptionReady(void* data, wp_image_description_v1* desc, uint32_t identity) {
+  (void)identity;
+  auto* self = static_cast<WaylandVideoSurface*>(data);
+  if (self->staged_description_ != desc) return;
+  self->SettleTransition(true);
+}
+
+void WaylandVideoSurface::HandleImageDescriptionReady2(
+    void* data, wp_image_description_v1* desc, uint32_t identity_hi, uint32_t identity_lo) {
+  (void)identity_hi;
+  (void)identity_lo;
+  HandleImageDescriptionReady(data, desc, 0);
 }
 
 void WaylandVideoSurface::HandleImageDescriptionFailed(
     void* data, wp_image_description_v1* desc, uint32_t cause, const char* message) {
-  (void)desc;
   auto* self = static_cast<WaylandVideoSurface*>(data);
-  self->hdr_active_ = false;
-  g_warning("MPV video plane: compositor rejected the HDR image description (cause %u): %s", cause,
-            message ? message : "no reason given");
-  self->ClearImageDescription();
+  if (self->staged_description_ != desc) return;
+  g_warning(
+      "MPV video plane: compositor rejected the HDR image description (cause %u): %s", cause,
+      message ? message : "no reason given");
+  // Left staged so Abort - which the caller reaches via on_settled(false) - is the
+  // single place that tears the transition down.
+  self->SettleTransition(false);
 }
 
 namespace {
 
 bool SameMetadata(const HdrMetadata& a, const HdrMetadata& b) {
-  return a.max_cll == b.max_cll && a.max_fall == b.max_fall &&
+  return a.transfer == b.transfer && a.primaries == b.primaries && a.max_cll == b.max_cll && a.max_fall == b.max_fall &&
          a.max_luminance == b.max_luminance && a.min_luminance == b.min_luminance;
+}
+
+// Only ever called for sources CanDescribeSource() accepted, so the SDR arm is
+// unreachable; PQ is returned there rather than a sentinel because there is no
+// "unset" value and the caller has already refused to describe such a source.
+uint32_t SourceTransferNamed(const HdrMetadata& metadata) {
+  if (metadata.transfer == SourceTransfer::kHlg) {
+    return WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_HLG;
+  }
+  return WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ;
+}
+
+uint32_t SourcePrimariesNamed(const HdrMetadata& metadata) {
+  (void)metadata;  // BT.2020 is the only gamut CanDescribeSource() lets through.
+  return WP_COLOR_MANAGER_V1_PRIMARIES_BT2020;
 }
 
 }  // namespace
 
-void WaylandVideoSurface::SetHdr(bool enabled, const HdrMetadata& metadata) {
-  if (!supports_hdr_ || color_surface_ == nullptr) return;
-  if (enabled == hdr_requested_ && (!enabled || image_description_ != nullptr)) {
-    // Already in the requested state, but the caller may have learned more
-    // about the source since - HDR is commonly switched on before a file is
-    // open, when there is no metadata to read yet.
-    if (enabled) RefreshHdrMetadata(metadata);
+bool WaylandVideoSurface::CanDescribeSource(const HdrMetadata& metadata) const {
+  if (!SourceIsHdr(metadata)) return false;
+  // A wide-gamut container is part of what makes this worth doing, and the named
+  // primaries have to be ones the compositor accepts.
+  if (metadata.primaries != SourcePrimaries::kBt2020 || !supports_bt2020_) return false;
+  switch (metadata.transfer) {
+    case SourceTransfer::kPq:
+      return supports_pq_;
+    case SourceTransfer::kHlg:
+      return supports_hlg_;
+    case SourceTransfer::kSdr:
+      break;
+  }
+  return false;
+}
+
+void WaylandVideoSurface::BeginHdrTransition(
+    bool describe, const HdrMetadata& metadata, std::function<void(uint64_t, bool)> on_settled) {
+  // The two hard capabilities are still checked here: they are facts about this
+  // surface rather than policy, and DecideHdr cannot know them.
+  if (!supports_hdr_ || color_surface_ == nullptr) {
+    if (on_settled) on_settled(0, !describe);
+    return;
+  }
+  // A transition already staged is superseded, and its waiter is told so rather
+  // than dropped.
+  if (transition_staged_) DiscardTransition();
+
+  // Nothing would change: same answer, same source. Report settled without
+  // holding Present() or building anything, which is what keeps the per-seek
+  // playback-restart path free. Token zero: there is nothing to commit.
+  if (describe == hdr_active_ && SameMetadata(metadata_, metadata)) {
+    if (on_settled) on_settled(0, true);
     return;
   }
 
-  hdr_requested_ = enabled;
-  ClearImageDescription();
+  transition_staged_ = true;
+  transition_token_ += 1;
+  staged_settled_ = false;
+  staged_describe_ = describe;
+  staged_metadata_ = metadata;
+  on_transition_settled_ = std::move(on_settled);
 
-  if (!enabled) {
-    if (hdr_active_) {
-      wp_color_management_surface_v1_unset_image_description(color_surface_);
-      hdr_active_ = false;
-      RequestParentCommit();
-    }
+  if (!describe) {
+    // Unsetting needs no validation, so it is settled at once; the request itself
+    // is deferred to Commit so it still lands on the same commit as the first
+    // buffer mpv renders in the new colour space.
+    SettleTransition(true);
     return;
   }
-
-  metadata_ = metadata;
   BuildImageDescription();
 }
 
-void WaylandVideoSurface::RefreshHdrMetadata(const HdrMetadata& metadata) {
-  if (!hdr_requested_ || !supports_hdr_ || color_surface_ == nullptr) return;
-  if (SameMetadata(metadata_, metadata)) return;
-  metadata_ = metadata;
-  // The description is immutable once created, so new metadata means building
-  // a replacement and swapping it in on the next commit.
-  ClearImageDescription();
-  BuildImageDescription();
+bool WaylandVideoSurface::CommitHdrTransition(uint64_t token) {
+  // A stale token means this transition was superseded while its caller's mpv
+  // request was still in flight. Committing then would pair the newer
+  // description with the older pixels, which is exactly what the token exists to
+  // prevent. Token zero is the "nothing was staged" case.
+  if (!transition_staged_ || token == 0 || token != transition_token_) return false;
+
+  const bool describe = staged_describe_;
+  metadata_ = staged_metadata_;
+
+  if (describe) {
+    if (staged_description_ == nullptr) {
+      DiscardTransition();
+      return false;
+    }
+    // Copy semantics: the object may be destroyed immediately afterwards, and the
+    // pending state now carries the description until the next commit.
+    wp_color_management_surface_v1_set_image_description(
+        color_surface_, staged_description_, WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL);
+    hdr_requested_ = true;
+    hdr_active_ = true;
+    g_message("MPV video plane: image description attached");
+  } else if (hdr_active_) {
+    wp_color_management_surface_v1_unset_image_description(color_surface_);
+    hdr_requested_ = false;
+    hdr_active_ = false;
+    g_message("MPV video plane: image description cleared");
+  } else {
+    hdr_requested_ = false;
+  }
+
+  ClearStagedDescription();
+  transition_staged_ = false;
+  staged_settled_ = false;
+  // Already moved out by SettleTransition, which is how the caller got here.
+  on_transition_settled_ = nullptr;
+
+  // The colour state is now pending on the child surface and lands on its next
+  // commit, which only eglSwapBuffers performs. Telling the caller to render and
+  // present now is what makes the pairing atomic: the buffer that carries the new
+  // state is the first one rendered in it.
+  //
+  // The parent commit is for the subsurface's own state, not the child's, and is
+  // requested separately once the child has committed.
+  return true;
+}
+
+void WaylandVideoSurface::AbortHdrTransition(uint64_t token) {
+  if (!transition_staged_ || token == 0 || token != transition_token_) return;
+  DiscardTransition();
+}
+
+void WaylandVideoSurface::DiscardTransition() {
+  if (!transition_staged_) return;
+  // The callback is moved out and the state torn down *before* it is invoked, so
+  // a handler that aborts again finds nothing staged and the recursion stops.
+  auto displaced = std::move(on_transition_settled_);
+  const uint64_t token = transition_token_;
+  on_transition_settled_ = nullptr;
+  ClearStagedDescription();
+  transition_staged_ = false;
+  staged_settled_ = false;
+  // A waiting caller must always hear an outcome. Silently dropping it strands
+  // whatever it was going to answer - for the platform channel, a method call
+  // that never responds and whose reference is never released. `false` is the
+  // truth: this transition will not be committed.
+  if (displaced) displaced(token, false);
+}
+
+bool WaylandVideoSurface::ForceUndescribed() {
+  DiscardTransition();
+  if (color_surface_ == nullptr || !hdr_active_) {
+    hdr_requested_ = false;
+    return false;
+  }
+  wp_color_management_surface_v1_unset_image_description(color_surface_);
+  hdr_requested_ = false;
+  hdr_active_ = false;
+  g_warning("MPV video plane: description withdrawn, mpv's colour space had to be forced to SDR");
+  // Lands on the child surface's next commit, so the caller has to present for it
+  // to take effect.
+  return true;
 }
 
 void WaylandVideoSurface::BuildImageDescription() {
-  const HdrMetadata& metadata = metadata_;
-  wp_image_description_creator_params_v1* creator =
-      wp_color_manager_v1_create_parametric_creator(color_manager_);
+  // The staged metadata, not the committed one: this description belongs to the
+  // transition being validated, and metadata_ only moves when it commits.
+  const HdrMetadata& metadata = staged_metadata_;
+  wp_image_description_creator_params_v1* creator = wp_color_manager_v1_create_parametric_creator(color_manager_);
   if (creator == nullptr) {
     g_warning("MPV video plane: compositor refused a parametric image-description creator");
-    hdr_requested_ = false;
+    SettleTransition(false);
     return;
   }
 
-  wp_image_description_creator_params_v1_set_tf_named(
-      creator, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ);
-  wp_image_description_creator_params_v1_set_primaries_named(
-      creator, WP_COLOR_MANAGER_V1_PRIMARIES_BT2020);
+  // Describe the source's own curve and gamut, never a fixed PQ / BT.2020. The
+  // compositor is being told what the buffer holds, so anything else is a lie
+  // that it will faithfully act on.
+  wp_image_description_creator_params_v1_set_tf_named(creator, SourceTransferNamed(metadata));
+  wp_image_description_creator_params_v1_set_primaries_named(creator, SourcePrimariesNamed(metadata));
 
-  // Only forward metadata the source actually carried. Inventing values here
-  // would have the compositor tone-map against a mastering display that never
-  // existed, which is worse than letting it apply its own default.
+  // Only forward metadata the source actually carried, and only in a
+  // combination the protocol accepts. Inventing values would have the
+  // compositor tone-map against a mastering display that never existed, and
+  // forwarding an incoherent set is worse still: every luminance rule here is a
+  // protocol *error* on create(), so a badly authored file would disconnect the
+  // whole client rather than merely fail the description.
   //
-  // Without any of this the compositor has to assume the worst case the PQ
-  // curve allows - 10000 nits - and rolls the highlights off far harder than
-  // the content needs, which is visible as crushed, flat highlights next to a
-  // player that does forward it.
-  if (supports_mastering_ && metadata.max_luminance > 0) {
-    // min L is carried scaled by 10000 to keep four decimals. The protocol
-    // raises invalid_luminance - a fatal error, not a rejected description -
-    // if max is not strictly greater than min, so clamp rather than trust the
-    // file.
-    const uint32_t min_lum = static_cast<uint32_t>(metadata.min_luminance * 10000.0 + 0.5);
-    const uint32_t max_lum = metadata.max_luminance;
-    if (max_lum * 10000u > min_lum) {
-      wp_image_description_creator_params_v1_set_mastering_luminance(creator, min_lum, max_lum);
-    }
+  // Note that omitting all of it is not neutral either - the compositor then
+  // has to assume the worst case the PQ curve allows, 10000 nits, and rolls the
+  // highlights off far harder than the content needs. So send as much as is
+  // legal, and no more. PlanHdrLuminance decides; see hdr_metadata.h.
+  const HdrLuminancePlan plan = PlanHdrLuminance(metadata, luminance_support_);
+  if (plan.send_mastering) {
+    wp_image_description_creator_params_v1_set_mastering_luminance(
+        creator, plan.mastering_min_scaled, plan.mastering_max);
   }
-  if (metadata.max_cll > 0) {
-    wp_image_description_creator_params_v1_set_max_cll(creator, metadata.max_cll);
+  if (plan.send_max_cll) {
+    wp_image_description_creator_params_v1_set_max_cll(creator, plan.max_cll);
   }
-  if (metadata.max_fall > 0) {
-    wp_image_description_creator_params_v1_set_max_fall(creator, metadata.max_fall);
+  if (plan.send_max_fall) {
+    wp_image_description_creator_params_v1_set_max_fall(creator, plan.max_fall);
+  }
+  if (plan.send_max_cll != (metadata.max_cll > 0) || plan.send_max_fall != (metadata.max_fall > 0)) {
+    g_message(
+        "MPV video plane: dropped source light levels the protocol would reject "
+        "(MaxCLL %u kept=%d, MaxFALL %u kept=%d, mastering max %u kept=%d)",
+        metadata.max_cll, plan.send_max_cll, metadata.max_fall, plan.send_max_fall, plan.mastering_max,
+        plan.send_mastering);
   }
 
   // create() consumes the creator, so it must not be destroyed afterwards.
+  //
+  // Every member must be filled in. libwayland calls implementation[opcode]
+  // through libffi with no null check, so a listener that is short by one
+  // member is a segfault on the first compositor that sends that event - not a
+  // dropped notification. The static_assert is the tripwire for re-vendoring a
+  // newer color-management-v1.xml: if the generated struct grows an event,
+  // the build fails here instead of the app crashing in the field.
+  static_assert(
+      sizeof(wp_image_description_v1_listener) == 3 * sizeof(void (*)()),
+      "wp_image_description_v1_listener gained an event; handle it below");
   static const wp_image_description_v1_listener kDescriptionListener = {
       HandleImageDescriptionFailed,
       HandleImageDescriptionReady,
+      HandleImageDescriptionReady2,
   };
-  image_description_ = wp_image_description_creator_params_v1_create(creator);
-  if (image_description_ == nullptr) {
+  staged_description_ = wp_image_description_creator_params_v1_create(creator);
+  if (staged_description_ == nullptr) {
     g_warning("MPV video plane: could not create the HDR image description");
-    hdr_requested_ = false;
+    SettleTransition(false);
     return;
   }
-  wp_image_description_v1_add_listener(image_description_, &kDescriptionListener, this);
+  wp_image_description_v1_add_listener(staged_description_, &kDescriptionListener, this);
 }
 
 void WaylandVideoSurface::ClearFrameCallback() {
@@ -442,7 +880,19 @@ void WaylandVideoSurface::Destroy() {
   }
   ClearFrameCallback();
   on_frame_ = nullptr;
-  ClearImageDescription();
+  // Drops the staged description and, importantly, the settled callback: it
+  // captures the plugin, which is being torn down alongside this.
+  DiscardTransition();
+  // Before the colour surface and manager: these are children of the manager
+  // and reference the wl_surface.
+  ClearPreferredQuery();
+  on_preferred_changed_ = nullptr;
+  if (color_feedback_ != nullptr) {
+    wp_color_management_surface_feedback_v1_destroy(color_feedback_);
+    color_feedback_ = nullptr;
+  }
+  preferred_ = PreferredColorDescription();
+  pending_preferred_ = PreferredColorDescription();
   if (color_surface_ != nullptr) {
     wp_color_management_surface_v1_destroy(color_surface_);
     color_surface_ = nullptr;
@@ -526,6 +976,12 @@ void WaylandVideoSurface::SetVisible(bool visible) {
 
 bool WaylandVideoSurface::Present() {
   if (!visible_ || egl_surface_ == EGL_NO_SURFACE || frame_pending_) return false;
+  // Held while a colour transition is staged. eglSwapBuffers is the child
+  // surface's commit, so presenting now would publish a buffer paired with a
+  // colour state it was not rendered for - the flash this whole two-phase dance
+  // exists to avoid. The previously presented frame stays up for the duration of
+  // one property round-trip.
+  if (transition_staged_) return false;
 
   // Ask for the acknowledgement before the commit that eglSwapBuffers performs,
   // so the callback belongs to this frame.

@@ -175,3 +175,17 @@ if(PLEZY_BUILD_MPV_RELIABILITY_TESTS)
   apply_mpv_reliability_sanitizer(mpv_gpu_bootstrap_test)
   add_test(NAME mpv_gpu_bootstrap_test COMMAND mpv_gpu_bootstrap_test)
 endif()
+
+if(PLEZY_BUILD_MPV_RELIABILITY_TESTS)
+  # Header-only and free of Wayland: the luminance rules it enforces are
+  # protocol *errors* that disconnect the client, so they are worth testing
+  # without a compositor in the loop.
+  add_executable(hdr_metadata_test
+    "mpv/hdr_metadata_test.cc"
+  )
+  apply_standard_settings(hdr_metadata_test)
+  target_compile_features(hdr_metadata_test PRIVATE cxx_std_14)
+  target_include_directories(hdr_metadata_test PRIVATE "mpv")
+  apply_mpv_reliability_sanitizer(hdr_metadata_test)
+  add_test(NAME hdr_metadata_test COMMAND hdr_metadata_test)
+endif()

@@ -336,10 +336,20 @@ bool MpvPlayer::Initialize() {
   mpv_set_option_string(mpv_, "audio-fallback-to-null", "yes");
 
   if (!audio_only_) {
-    // HDR tone mapping
+    // Both of these are what the player-side tone-mapping path needs, and both
+    // are inert without it, so neither is toggled per mode.
+    //
+    // tone-mapping=auto resolves to BT.2390 in the legacy renderer, but only
+    // when a tone-map pass actually runs — which happens exactly when the
+    // source's declared peak exceeds target-peak. hdr-compute-peak=auto is
+    // likewise nested under that same predicate, so it costs nothing while the
+    // compositor owns tone mapping and gives content-adaptive peak detection
+    // once we own it.
     mpv_set_option_string(mpv_, "tone-mapping", "auto");
-    mpv_set_option_string(mpv_, "target-colorspace-hint", plezy::mpv_common::TargetColorspaceHint(hdr_enabled_));
     mpv_set_option_string(mpv_, "hdr-compute-peak", "auto");
+    // Declared by vo_gpu_next only, so inert for the render API. Kept because
+    // the same code serves platforms whose players do read it.
+    mpv_set_option_string(mpv_, "target-colorspace-hint", plezy::mpv_common::TargetColorspaceHint(hdr_enabled_));
   }
   mpv_set_option_string(mpv_, "idle", "yes");
   mpv_set_option_string(mpv_, "input-default-bindings", "no");
@@ -527,7 +537,7 @@ bool MpvPlayer::InitRenderContext() {
   return true;
 }
 
-bool MpvPlayer::InitRenderContextForSurface(EGLDisplay display, EGLConfig config, EGLSurface surface) {
+bool MpvPlayer::InitRenderContextForSurface(EGLDisplay display, EGLConfig config, EGLSurface surface, int depth_bits) {
   RetryPendingNativeTeardown();
 
   std::lock_guard<std::mutex> lock(native_mutex_);
@@ -611,6 +621,7 @@ bool MpvPlayer::InitRenderContextForSurface(EGLDisplay display, EGLConfig config
 
   egl_display_ = display;
   egl_context_ = candidate_context;
+  surface_depth_bits_ = depth_bits > 0 ? depth_bits : 8;
   mpv_gl_ = candidate_gl;
   mpv_render_context_set_update_callback(mpv_gl_, OnMpvRenderUpdate, callback_context_.get());
   g_message("MPV: Render context created on the Wayland video plane");
@@ -635,14 +646,21 @@ bool MpvPlayer::RenderToSurface(EGLSurface surface, int width, int height) {
   mpv_fbo.fbo = 0;  // the window surface's default framebuffer
   mpv_fbo.w = width;
   mpv_fbo.h = height;
-  mpv_fbo.internal_format = 0;
+  // Ignored by the render API's OpenGL backend, which reads the depth param
+  // instead, but it is what mpv#16818's gpu-next backend will read, so state
+  // it truthfully rather than leave a lie in place for that day.
+  mpv_fbo.internal_format = surface_depth_bits_ >= 10 ? GL_RGB10_A2 : GL_RGBA8;
 
   // The default framebuffer is bottom-up relative to mpv's image orientation,
   // unlike the texture path's own FBO, so this one flips.
   int flip_y = 1;
+  // Without this mpv assumes 8 bits and dithers a 10-bit PQ plane down to 8,
+  // which bands precisely in the dark ramp PQ spends most of its code space on.
+  int depth = surface_depth_bits_;
   mpv_render_param params[] = {
       {MPV_RENDER_PARAM_OPENGL_FBO, &mpv_fbo},
       {MPV_RENDER_PARAM_FLIP_Y, &flip_y},
+      {MPV_RENDER_PARAM_DEPTH, &depth},
       {MPV_RENDER_PARAM_INVALID, nullptr},
   };
   mpv_render_context_render(mpv_gl_, params);
@@ -775,7 +793,7 @@ bool MpvPlayer::ReadSourceHdrMetadata(SourceHdrMetadata* out) {
   std::lock_guard<std::mutex> lock(native_mutex_);
   if (disposed_ || !mpv_) return false;
 
-  // Each of these is absent unless the stream actually carried it, and mpv
+  // Each luminance is absent unless the stream actually carried it, and mpv
   // reports that as an error rather than a zero, so a failed read is a normal
   // outcome and leaves the field at zero.
   auto read = [this](const char* name, double* value) {
@@ -786,17 +804,30 @@ bool MpvPlayer::ReadSourceHdrMetadata(SourceHdrMetadata* out) {
     return true;
   };
 
-  bool any = read("video-params/max-cll", &out->max_cll);
-  any |= read("video-params/max-fall", &out->max_fall);
-  any |= read("video-params/max-luma", &out->max_luminance);
+  // The colour space names, on the other hand, decide whether the plane may be
+  // described as HDR at all, so they are read whether or not any luminance is
+  // present: plenty of HDR10 carries a PQ curve and no static metadata.
+  auto read_name = [this](const char* name, std::string* value) {
+    char* parsed = nullptr;
+    if (mpv_get_property(mpv_, name, MPV_FORMAT_STRING, &parsed) < 0) return;
+    if (parsed != nullptr) {
+      value->assign(parsed);
+      mpv_free(parsed);
+    }
+  };
+  read_name("video-params/gamma", &out->transfer);
+  read_name("video-params/primaries", &out->primaries);
+
+  read("video-params/max-cll", &out->max_cll);
+  read("video-params/max-fall", &out->max_fall);
+  read("video-params/max-luma", &out->max_luminance);
   // A zero floor is legitimate here, unlike the others, so it is read on its
-  // own terms and never decides whether metadata was present.
+  // own terms.
   double min_luma = 0.0;
-  if (mpv_get_property(mpv_, "video-params/min-luma", MPV_FORMAT_DOUBLE, &min_luma) >= 0 &&
-      min_luma >= 0.0) {
+  if (mpv_get_property(mpv_, "video-params/min-luma", MPV_FORMAT_DOUBLE, &min_luma) >= 0 && min_luma >= 0.0) {
     out->min_luminance = min_luma;
   }
-  return any;
+  return true;
 }
 
 void MpvPlayer::GetPropertyAsync(const std::string& name, GetPropertyCallback callback) {
@@ -1187,18 +1218,180 @@ void MpvPlayer::SendEvent(const std::string& name, FlValue* data) {
   fl_value_unref(event_map);
 }
 
-void MpvPlayer::SetHdrOutput(bool enabled, StatusCallback callback) {
-  if (disposed_ || !mpv_) {
-    if (callback) callback(MPV_ERROR_UNINITIALIZED);
+void MpvPlayer::ApplyPropertySequence(
+    std::shared_ptr<std::vector<PropertyChange>> changes, size_t index, StatusCallback callback) {
+  if (changes == nullptr || index >= changes->size()) {
+    if (callback) callback(MPV_ERROR_SUCCESS);
     return;
   }
-  // Passthrough: encode PQ / BT.2020 and leave the peak at the PQ nominal so
-  // the renderer does not tone-map — the compositor owns that decision now,
-  // and on an SDR output it is the one that maps the plane down.
-  // target-peak stays auto in both directions: under PQ that resolves to the
-  // format's nominal 10000 nits, which is exactly the "do not tone-map" case.
-  SetPropertyAsync("target-prim", enabled ? "bt.2020" : "auto", nullptr);
-  SetPropertyAsync("target-trc", enabled ? "pq" : "auto", std::move(callback));
+  const PropertyChange& change = (*changes)[index];
+  SetPropertyAsync(change.name, change.value, [this, changes, index, cb = std::move(callback)](int error) mutable {
+    if (plezy::mpv_common::SetPropertyStatusSucceeded(error)) {
+      ApplyPropertySequence(changes, index + 1, std::move(cb));
+      return;
+    }
+    // `index` entries already landed and must come back, newest
+    // first, so a refused change leaves the previous state intact
+    // rather than a half-applied mixture of the two.
+    RollbackPropertySequence(changes, index, error, std::move(cb));
+  });
+}
+
+void MpvPlayer::RollbackPropertySequence(
+    std::shared_ptr<std::vector<PropertyChange>> changes, size_t undo_count, int failure, StatusCallback callback) {
+  if (changes == nullptr || undo_count == 0) {
+    // Only now is mpv genuinely back where it started, so only now may the caller
+    // hear about it. The original failure is what it needs, not the outcome of the
+    // unwinding.
+    if (callback) callback(failure);
+    return;
+  }
+  // Awaited, not fired and forgotten. The caller releases the plane's present
+  // hold and lets the next queued request run the moment it is told, and a
+  // rollback still in flight then means a frame can reach the screen in a colour
+  // space that is neither the old one nor the new.
+  const size_t index = undo_count - 1;
+  const PropertyChange& change = (*changes)[index];
+  SetPropertyAsync(
+      change.name, change.rollback, [this, changes, index, failure, cb = std::move(callback)](int error) mutable {
+        if (plezy::mpv_common::SetPropertyStatusSucceeded(error)) {
+          RollbackPropertySequence(changes, index, failure, std::move(cb));
+          return;
+        }
+        // Carrying on would leave mpv in a state that is neither the
+        // old one nor the new, and *no* surface description is correct
+        // for a signal nobody can name. Escalate to the one state that
+        // is always describable and always accepts its value: SDR.
+        g_warning(
+            "MPV: could not restore %s while unwinding a refused output colour space; "
+            "forcing SDR",
+            (*changes)[index].name.c_str());
+        ForceSdrOutput(0, failure, std::move(cb));
+      });
+}
+
+void MpvPlayer::ForceSdrOutput(size_t index, int failure, StatusCallback callback) {
+  // Reverse of the apply order, so the transfer function stops asking for HDR
+  // before the primaries and peak follow it back.
+  static const char* const kResetOrder[] = {"target-trc", "target-prim", "target-peak"};
+  constexpr size_t kResetCount = sizeof(kResetOrder) / sizeof(kResetOrder[0]);
+  if (index >= kResetCount) {
+    applied_target_trc_ = "auto";
+    applied_target_prim_ = "auto";
+    applied_target_peak_ = "auto";
+    // mpv is SDR now, not back where it started, so any HDR description the
+    // caller has already committed is a lie about these pixels.
+    hdr_unwind_result_ = HdrOutputResult::kForcedSdr;
+    if (callback) callback(failure);
+    return;
+  }
+  SetPropertyAsync(kResetOrder[index], "auto", [this, index, failure, cb = std::move(callback)](int error) mutable {
+    if (plezy::mpv_common::SetPropertyStatusSucceeded(error)) {
+      ForceSdrOutput(index + 1, failure, std::move(cb));
+      return;
+    }
+    // `auto` is valid for all three, so this failing means mpv is
+    // no longer taking orders at all - usually because it is being
+    // disposed. Either way what it emits is now unknowable, and the
+    // caller must stop presenting the plane rather than guess.
+    hdr_unwind_result_ = HdrOutputResult::kUnknown;
+    g_warning(
+        "MPV: output colour space is no longer commandable; what the plane emits "
+        "is unknown");
+    if (cb) cb(failure);
+  });
+}
+
+void MpvPlayer::SetHdrOutput(SourceTransfer transfer, uint32_t target_peak_nits, HdrOutputCallback callback) {
+  if (disposed_ || !mpv_) {
+    if (callback) callback(HdrOutputResult::kRestored, MPV_ERROR_UNINITIALIZED);
+    return;
+  }
+  // Requests are serialized, and queued rather than coalesced.
+  //
+  // Playback restarts, preferred-description changes and the two settings can
+  // each ask for a new output colour space, and every step of a sequence
+  // completes asynchronously. Two overlapping sequences would interleave: a
+  // failure in the older one would issue rollbacks that overwrite properties the
+  // newer one had already set, while the newer one still reported success and
+  // recorded values mpv no longer holds. That is the divergence the sequencing
+  // exists to prevent.
+  //
+  // Each request keeps its own callback instead of being folded into the newest
+  // one, because callers commit their own state on success: telling a caller its
+  // change landed when a *different* request is what actually landed reintroduces
+  // the same divergence one level up. Strict ordering then makes the bookkeeping
+  // trivial — the last request to succeed is exactly what mpv holds, so nobody
+  // needs an epoch to work out whether their commit is still current.
+  hdr_queue_.push_back(HdrOutputRequest{transfer, target_peak_nits, std::move(callback)});
+  if (hdr_sequence_in_flight_) return;
+  RunPendingHdrOutput();
+}
+
+void MpvPlayer::RunPendingHdrOutput() {
+  if (disposed_ || !mpv_) {
+    hdr_sequence_in_flight_ = false;
+    auto orphaned = std::move(hdr_queue_);
+    hdr_queue_.clear();
+    for (auto& request : orphaned) {
+      // Nothing was touched, so the previous state - whatever it was - still
+      // stands as far as this request is concerned.
+      if (request.callback) request.callback(HdrOutputResult::kRestored, MPV_ERROR_UNINITIALIZED);
+    }
+    return;
+  }
+  if (hdr_queue_.empty()) {
+    hdr_sequence_in_flight_ = false;
+    return;
+  }
+  auto request = std::make_shared<HdrOutputRequest>(std::move(hdr_queue_.front()));
+  hdr_queue_.pop_front();
+  hdr_sequence_in_flight_ = true;
+  // Assume a clean unwind; the escalation path in RollbackPropertySequence and
+  // ForceSdrOutput moves this on if it cannot manage one.
+  hdr_unwind_result_ = HdrOutputResult::kRestored;
+
+  // Three properties describe one output colour space, so they are applied as a
+  // unit. A plane whose primaries moved to BT.2020 while its transfer function
+  // stayed on gamma is neither SDR nor HDR, and the caller describes the surface
+  // to the compositor on success — a silently half-applied set would have the
+  // compositor told one thing and shown another.
+  //
+  // target-peak decides who tone-maps. Left at auto it resolves, under PQ, to
+  // the format's nominal 10000 nits, so the renderer never tone-maps and the
+  // compositor owns the decision. Set to the display's real peak, mpv tone-maps
+  // to it with BT.2390 and the caller then declares that peak, leaving the
+  // compositor nothing to do.
+  const bool enabled = request->transfer != SourceTransfer::kSdr;
+  const char* primaries = enabled ? "bt.2020" : "auto";
+  const char* curve =
+      request->transfer == SourceTransfer::kHlg ? "hlg" : (request->transfer == SourceTransfer::kPq ? "pq" : "auto");
+  // The option is an integer in [10, 10000]; anything outside means "auto".
+  const bool tone_map_here = enabled && request->peak_nits >= 10 && request->peak_nits <= kPqMaxLuminanceNits;
+  const std::string peak = tone_map_here ? std::to_string(request->peak_nits) : std::string("auto");
+
+  auto changes = std::make_shared<std::vector<PropertyChange>>();
+  changes->push_back({"target-peak", peak, applied_target_peak_});
+  changes->push_back({"target-prim", primaries, applied_target_prim_});
+  changes->push_back({"target-trc", curve, applied_target_trc_});
+  ApplyPropertySequence(changes, 0, [this, changes, request](int error) {
+    const bool ok = plezy::mpv_common::SetPropertyStatusSucceeded(error);
+    // Only a fully applied set becomes the new rollback target; a failed one was
+    // already unwound, and the unwinding updated these itself if it had to force
+    // SDR.
+    if (ok && !disposed_) {
+      applied_target_peak_ = (*changes)[0].value;
+      applied_target_prim_ = (*changes)[1].value;
+      applied_target_trc_ = (*changes)[2].value;
+    }
+    // This request's own outcome, to this request's own caller. The result names
+    // what mpv is actually in now, which is what decides whether the caller's
+    // committed surface description is still true.
+    const HdrOutputResult result = ok ? HdrOutputResult::kApplied : hdr_unwind_result_;
+    if (request->callback) request->callback(result, error);
+    // Whatever arrived while this ran runs now — never alongside.
+    RunPendingHdrOutput();
+  });
 }
 
 void MpvPlayer::SetHDREnabled(bool enabled, StatusCallback callback) {

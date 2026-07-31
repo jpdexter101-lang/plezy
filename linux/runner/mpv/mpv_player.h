@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -19,6 +20,7 @@
 #include <vector>
 
 #include "../../../shared/mpv/mpv_player_common.h"
+#include "hdr_metadata.h"
 
 // Forward declaration for Flutter types
 struct _FlValue;
@@ -100,8 +102,14 @@ class MpvPlayer {
   /// Flutter's GL state, so the context is free to be ES 3.x. The resulting
   /// display/context pair is stored in the same fields the texture path uses,
   /// so disposal and the process-lifetime teardown queue are unchanged.
+  ///
+  /// `depth_bits` is the plane's bits per colour channel. mpv takes the
+  /// target's precision from MPV_RENDER_PARAM_DEPTH and from nothing else —
+  /// the render API's OpenGL backend ignores mpv_opengl_fbo::internal_format —
+  /// and assumes 8 when it is absent, which would dither a PQ plane to 8 bits
+  /// and band it exactly where the 10-bit config was chosen to avoid that.
   /// @return true if render context creation succeeded.
-  bool InitRenderContextForSurface(EGLDisplay display, EGLConfig config, EGLSurface surface);
+  bool InitRenderContextForSurface(EGLDisplay display, EGLConfig config, EGLSurface surface, int depth_bits);
 
   /// Renders one frame into |surface|'s default framebuffer. The caller
   /// presents it (eglSwapBuffers) once this returns.
@@ -147,26 +155,65 @@ class MpvPlayer {
   /// Sets an mpv property asynchronously.
   void SetPropertyAsync(const std::string& name, const std::string& value, StatusCallback callback);
 
-  /// Switches mpv's output colour space between PQ / BT.2020 passthrough and
-  /// its normal tone-mapped SDR output.
+  /// What became of an HDR output request. The caller has to distinguish these,
+  /// because each implies a different truth about the surface description it may
+  /// already have committed.
+  enum class HdrOutputResult {
+    /// mpv is in the requested colour space; the caller's new description is true.
+    kApplied,
+    /// Refused, and mpv is back in the colour space it had; the previously
+    /// committed description is still true and must be left alone.
+    kRestored,
+    /// Refused, and could not be put back, so it was forced to SDR. Any committed
+    /// HDR description is now a lie about the pixels and must be unset.
+    kForcedSdr,
+    /// Refused, and mpv no longer accepts even `auto`. What it emits is unknowable,
+    /// so no description is correct and the plane should not be presented.
+    kUnknown,
+  };
+  using HdrOutputCallback = std::function<void(HdrOutputResult, int)>;
+
+  /// Switches mpv's output colour space between HDR passthrough and its normal
+  /// tone-mapped SDR output.
   ///
   /// `target-colorspace-hint` is deliberately not used: it is declared by
   /// vo_gpu_next only, so the render API — which runs the legacy gpu renderer —
   /// ignores it entirely. target-trc/target-prim are what that renderer reads.
-  void SetHdrOutput(bool enabled, StatusCallback callback);
+  ///
+  /// `transfer` is the curve mpv should emit, taken from the source rather than
+  /// assumed: HLG content described to the compositor as HLG must also be
+  /// *encoded* as HLG. SourceTransfer::kSdr restores the tone-mapped output.
+  ///
+  /// All three properties are applied as a unit, and on failure the ones that
+  /// landed are unwound — awaited, not fired and forgotten — so that by the time
+  /// the callback runs mpv is in exactly the state the result names.
+  ///
+  /// `target_peak_nits` decides who tone-maps. Zero (or anything outside mpv's
+  /// 10..10000 range) leaves `target-peak` on auto, which under PQ resolves to
+  /// the format's nominal 10000 nits so the renderer passes the source through
+  /// untouched and the compositor tone-maps. A real display peak makes mpv
+  /// tone-map to it instead, and the caller should then declare that peak to the
+  /// compositor so it has nothing left to do.
+  void SetHdrOutput(SourceTransfer transfer, uint32_t target_peak_nits, HdrOutputCallback callback);
 
-  /// HDR10 static metadata as carried by the current source. A zero field
-  /// means the file did not state it.
+  /// What the current source's colour space is, plus its HDR10 static metadata.
+  /// A zero luminance means the file did not state it; the strings are mpv's own
+  /// names from `video-params/gamma` and `video-params/primaries` and are empty
+  /// when nothing is loaded.
   struct SourceHdrMetadata {
+    std::string transfer;        ///< mpv trc name, e.g. "pq", "hlg", "bt.1886"
+    std::string primaries;       ///< mpv primaries name, e.g. "bt.2020"
     double max_cll = 0.0;        ///< nits, maximum content light level
     double max_fall = 0.0;       ///< nits, maximum frame-average light level
     double max_luminance = 0.0;  ///< nits, mastering display maximum
     double min_luminance = 0.0;  ///< nits, mastering display minimum
   };
 
-  /// Reads the current source's HDR10 static metadata, returning false when
-  /// the file carries none. Synchronous, but only reads already-parsed stream
-  /// parameters rather than reaching into the decoder.
+  /// Reads the current source's colour space and HDR10 static metadata.
+  /// Returns false only when there is no player to ask; a source that carries
+  /// no metadata still fills in the transfer and primaries names. Synchronous,
+  /// but only reads already-parsed stream parameters rather than reaching into
+  /// the decoder.
   bool ReadSourceHdrMetadata(SourceHdrMetadata* out);
 
   /// Gets an mpv property value asynchronously.
@@ -279,6 +326,58 @@ class MpvPlayer {
   void LogRecovery(const std::string& text);
   void SetHDREnabled(bool enabled, StatusCallback callback = nullptr);
 
+  /// One step of an all-or-nothing property change: the value to set, and the
+  /// value to restore if a *later* step in the same sequence fails.
+  struct PropertyChange {
+    std::string name;
+    std::string value;
+    std::string rollback;
+  };
+
+  /// Applies `changes` in order, starting at `index`. On the first failure every
+  /// earlier change is rolled back, newest first, and the callback reports that
+  /// failure; otherwise the callback reports success once all of them landed.
+  ///
+  /// Shared ownership because each step completes on an mpv thread after this
+  /// call has returned.
+  void ApplyPropertySequence(
+      std::shared_ptr<std::vector<PropertyChange>> changes, size_t index, StatusCallback callback);
+
+  /// Restores the first `undo_count` changes, newest first, awaiting each reply
+  /// before the next. `failure` is the error that triggered the unwinding and is
+  /// what the callback finally reports — the outcome of the rollback itself is not
+  /// what the caller needs to know.
+  ///
+  /// Awaited rather than fired and forgotten: the caller releases the video
+  /// plane's present hold and starts the next request the moment it is told, so a
+  /// rollback still in flight would let a frame reach the screen in a colour space
+  /// that is neither the old one nor the new.
+  void RollbackPropertySequence(
+      std::shared_ptr<std::vector<PropertyChange>> changes, size_t undo_count, int failure, StatusCallback callback);
+
+  /// Drives all three target properties to `auto` — the one state that is always
+  /// describable and always accepts its value — after an unwinding step itself
+  /// failed. Reports `failure`, the original refusal, once mpv is settled.
+  void ForceSdrOutput(size_t index, int failure, StatusCallback callback);
+
+  /// Runs the next queued HDR output request. One sequence at a time; the next
+  /// starts only after the previous has finished, rollbacks included.
+  void RunPendingHdrOutput();
+
+  /// A desired output colour space, waiting its turn, with the callback that
+  /// asked for it.
+  ///
+  /// Requests are queued rather than coalesced. Callers commit their own state on
+  /// success, so each must learn the outcome of *its* request; folding several
+  /// into one and broadcasting a single result would tell a caller its change
+  /// landed when a different one did. Strict ordering also means the last
+  /// success is what mpv holds, so no epoch bookkeeping is needed.
+  struct HdrOutputRequest {
+    SourceTransfer transfer = SourceTransfer::kSdr;
+    uint32_t peak_nits = 0;
+    HdrOutputCallback callback;
+  };
+
   /// Helper to convert mpv_node to FlValue, bounded by the shared node budget.
   ::_FlValue* NodeToFlValue(mpv_node* node);
   ::_FlValue* NodeToFlValue(mpv_node* node, plezy::mpv_common::NodeConversionBudget* budget);
@@ -290,6 +389,25 @@ class MpvPlayer {
   // Isolated EGL context for mpv rendering (not shared with Flutter)
   EGLDisplay egl_display_ = EGL_NO_DISPLAY;
   EGLContext egl_context_ = EGL_NO_CONTEXT;
+
+  // The output colour space mpv last accepted in full, so a refused change can
+  // be unwound to something real instead of a guess. mpv's own defaults.
+  std::string applied_target_peak_ = "auto";
+  std::string applied_target_prim_ = "auto";
+  std::string applied_target_trc_ = "auto";
+  // What the unwinding of a refused sequence achieved. Reset to kRestored before
+  // each sequence; the escalation path moves it to kForcedSdr or kUnknown, and
+  // RunPendingHdrOutput reports whichever applies.
+  HdrOutputResult hdr_unwind_result_ = HdrOutputResult::kRestored;
+  // Serialization for SetHdrOutput. Touched only from the GLib main context:
+  // requests arrive from the platform channel and from mpv event handling, and
+  // ProcessEvents runs on a main-context source, so replies land on that same
+  // thread rather than on an mpv worker.
+  bool hdr_sequence_in_flight_ = false;
+  std::deque<HdrOutputRequest> hdr_queue_;
+  // Bits per colour channel of the video plane, told to mpv on every render so
+  // it dithers to the plane's real precision instead of the assumed 8.
+  int surface_depth_bits_ = 8;
   std::vector<NativeRenderTeardownResource> retained_render_contexts_;
   mutable std::mutex native_mutex_;
 
