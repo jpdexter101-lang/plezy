@@ -287,12 +287,18 @@ jobs:
             -DPLEZY_BUILD_MPV_RELIABILITY_TESTS=ON \
             -DPLEZY_MPV_RELIABILITY_SANITIZER=${{ matrix.sanitizer }}
 
+      # `plezy` is the runner itself. Without it nothing in CI ever compiles
+      # my_application.cc, mpv_plugin.cc or the Wayland video plane — the
+      # reliability test targets each pull in only a couple of translation units,
+      # so a break in the rest of linux/runner reached a release build unseen.
       - name: Build Linux native reliability tests
         run: |
           cmake --build build/linux-native-${{ matrix.sanitizer }} --parallel 2 --target \
+            plezy \
             mpv_player_lifecycle_test \
             mpv_property_result_contract_test \
-            mpv_gpu_bootstrap_test
+            mpv_gpu_bootstrap_test \
+            hdr_metadata_test
 
       - name: Run Linux native reliability tests
         run: |
