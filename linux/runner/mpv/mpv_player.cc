@@ -1380,11 +1380,19 @@ void MpvPlayer::RunPendingHdrOutput() {
   // below — an SDR peak is a real instruction, not a leftover from an HDR request.
   const bool enabled = request->transfer != SourceTransfer::kSdr;
   const char* primaries = enabled ? "bt.2020" : "auto";
-  const char* curve =
-      request->transfer == SourceTransfer::kHlg ? "hlg" : (request->transfer == SourceTransfer::kPq ? "pq" : "auto");
   // The option is an integer in [10, 10000]; anything outside means "auto".
   const bool tone_map_here = request->peak_nits >= 10 && request->peak_nits <= kPqMaxLuminanceNits;
   const std::string peak = tone_map_here ? std::to_string(request->peak_nits) : std::string("auto");
+  // Naming the peak is not sufficient on its own: measured with peak=200 and the
+  // curve left on auto, the output was byte-for-byte what auto alone produced.
+  // mpv has to know the transfer it is mapping *into* before a peak means
+  // anything, and on the render API it cannot discover one - so on the fallback
+  // it is named here. sRGB is what the surface is: an undescribed Wayland surface
+  // is sRGB by convention, and this compositor's preferred description for the
+  // output agrees.
+  const char* curve = request->transfer == SourceTransfer::kHlg
+                          ? "hlg"
+                          : (request->transfer == SourceTransfer::kPq ? "pq" : (tone_map_here ? "srgb" : "auto"));
 
   // The three values that decide who tone-maps and against what, none of which
   // is visible on screen: two very different curves both look like working
