@@ -1398,16 +1398,21 @@ void MpvPlayer::RunPendingHdrOutput() {
   // The operator only matters while a tone-map pass runs, and it must go back to
   // auto when one does not: in this mpv it also drives gamut reduction, so
   // leaving mobius in place would reach wide-gamut SDR content that has nothing
-  // to tone-map. See InitMpv for why it is not a global option, and the commit
-  // that introduced it for the measurements behind the choice.
-  const char* operator_name = tone_map_here ? "mobius" : "auto";
+  // to tone-map. See InitMpv for why it is not a global option.
+  //
+  // Restricted to the undescribed SDR target, which is where it was measured.
+  // Player-side mapping onto an HDR output aims at a PQ target instead, and
+  // nothing has been measured there yet - that needs the external display - so
+  // it keeps mpv's own choice until it can be judged the same way.
+  const char* operator_name = (tone_map_here && !enabled) ? "mobius" : "auto";
 
   // The values that decide who tone-maps and against what, none of which is
   // visible on screen: two very different curves both look like working video.
   // Logged next to the plane's own decisions so a capture can be matched to the
   // state that produced it.
-  g_message("MPV: output colour target peak=%s prim=%s trc=%s tone-mapping=%s", peak.c_str(), primaries, curve,
-            operator_name);
+  g_message(
+      "MPV: output colour target peak=%s prim=%s trc=%s tone-mapping=%s", peak.c_str(), primaries, curve,
+      operator_name);
 
   // Dependencies first, peak last, matching the order kResetOrder uses. The peak
   // is what decides whether a tone-map pass runs at all, so everything that pass
