@@ -8,6 +8,9 @@
 //
 // Optional knobs:
 //   PLEZY_HARNESS_MPV_LOG=v|debug             mpv's own log stream
+//   PLEZY_HARNESS_MPV_PROPS=name=value,...     arbitrary mpv properties, so an
+//                                             option can be swept without a
+//                                             rebuild for each value
 //   PLEZY_HARNESS_HDR=1                       request HDR passthrough
 //   PLEZY_HARNESS_TONEMAP=compositor|player   which side tone-maps; the A/B leg
 //   PLEZY_HARNESS_INSET=<px>                  toggles a padding every 6s, so the
@@ -161,6 +164,30 @@ class _HarnessAppState extends State<_HarnessApp> {
       if (level != null && level.isNotEmpty) {
         await player.setLogLevel(level);
         stdout.writeln('HARNESS_MPV_LOG $level');
+      }
+      // Arbitrary mpv properties, so an option can be swept without a rebuild
+      // per value: PLEZY_HARNESS_MPV_PROPS='tone-mapping=bt.2390,target-peak=200'.
+      // Names the plugin intercepts (hdr-enabled, hdr-tone-mapping) go through
+      // their own paths above; everything else reaches mpv unchanged.
+      //
+      // Applied before open() so the first configured frame already has them.
+      final props = Platform.environment['PLEZY_HARNESS_MPV_PROPS'];
+      if (props != null && props.isNotEmpty) {
+        for (final pair in props.split(',')) {
+          final split = pair.indexOf('=');
+          if (split <= 0) {
+            stdout.writeln('HARNESS_MPV_PROP_ERROR not name=value: $pair');
+            continue;
+          }
+          final name = pair.substring(0, split).trim();
+          final value = pair.substring(split + 1).trim();
+          try {
+            await player.setProperty(name, value);
+            stdout.writeln('HARNESS_MPV_PROP $name=$value');
+          } catch (e) {
+            stdout.writeln('HARNESS_MPV_PROP_ERROR $name=$value: $e');
+          }
+        }
       }
       // Selected before hdr-enabled so the first description built already uses
       // the requested mode; the native side re-applies either way.
