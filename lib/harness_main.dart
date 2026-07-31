@@ -166,11 +166,19 @@ class _HarnessAppState extends State<_HarnessApp> {
         stdout.writeln('HARNESS_MPV_LOG $level');
       }
       // Arbitrary mpv properties, so an option can be swept without a rebuild
-      // per value: PLEZY_HARNESS_MPV_PROPS='tone-mapping=bt.2390,target-peak=200'.
+      // per value: PLEZY_HARNESS_MPV_PROPS='tone-mapping=mobius,target-peak=200'.
       // Names the plugin intercepts (hdr-enabled, hdr-tone-mapping) go through
       // their own paths above; everything else reaches mpv unchanged.
       //
-      // Applied before open() so the first configured frame already has them.
+      // Applied before open(), so the first configured frame already has them.
+      //
+      // That timing is also the catch, and it has already produced a wrong
+      // answer: the native side re-applies the whole output description on
+      // playback-restart and on every seek, so anything it manages -
+      // target-peak, target-prim, target-trc, tone-mapping - is overwritten
+      // moments later. A sweep of those reads back as the shipped value while
+      // looking perfectly plausible. Use this for properties the runner does not
+      // set itself; for the ones it does, change the code.
       //
       // A malformed or rejected override aborts the leg, for the same reason
       // PLEZY_HARNESS_TONEMAP does: these captures get labelled with the value
