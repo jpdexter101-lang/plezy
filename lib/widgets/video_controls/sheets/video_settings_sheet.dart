@@ -287,8 +287,7 @@ class _VideoSettingsSheetState extends State<VideoSettingsSheet> {
   // per platform, except on Linux where it depends on the compositor, the output
   // and the plane's bit depth, so it has to be asked for.
   bool get _supportsHdrControl =>
-      widget.supportsHdrControl ??
-      (Platform.isIOS || Platform.isMacOS || Platform.isWindows || _linuxHdrSupported);
+      widget.supportsHdrControl ?? (Platform.isIOS || Platform.isMacOS || Platform.isWindows || _linuxHdrSupported);
 
   bool get _showDebugDvConversionMode {
     if (!kDebugMode) return false;
@@ -850,9 +849,7 @@ class _VideoSettingsSheetState extends State<VideoSettingsSheet> {
           FocusableListTile(
             title: Text(mode.title, style: TextStyle(color: _hdrToneMapping == mode.value ? primary : null)),
             subtitle: Text(mode.subtitle, style: TextStyle(color: tokens(context).textMuted, fontSize: 12)),
-            trailing: _hdrToneMapping == mode.value
-                ? AppIcon(Symbols.check_rounded, fill: 1, color: primary)
-                : null,
+            trailing: _hdrToneMapping == mode.value ? AppIcon(Symbols.check_rounded, fill: 1, color: primary) : null,
             onTap: () => _setHdrToneMapping(mode.value),
           ),
       ],

@@ -104,9 +104,7 @@ class _HarnessAppState extends State<_HarnessApp> {
       final dropped = await player.getProperty('frame-drop-count');
       final decoded = await player.getProperty('decoder-frame-drop-count');
       final texture = player is PlayerBase ? player.textureId : null;
-      stdout.writeln(
-        'PROBE time-pos=$pos pause=$paused drops=$dropped dec_drops=$decoded texture=$texture',
-      );
+      stdout.writeln('PROBE time-pos=$pos pause=$paused drops=$dropped dec_drops=$decoded texture=$texture');
     } catch (e) {
       stdout.writeln('PROBE_ERROR $e');
     }
@@ -182,7 +180,9 @@ class _HarnessAppState extends State<_HarnessApp> {
       home: Scaffold(
         backgroundColor: Colors.transparent,
         body: player == null
-            ? Center(child: Text(_status, style: const TextStyle(color: Colors.white)))
+            ? Center(
+                child: Text(_status, style: const TextStyle(color: Colors.white)),
+              )
             : Padding(
                 // PLEZY_HARNESS_INSET insets the video rect so the native plane
                 // has to move *and* resize to a non-zero origin, which a plain
