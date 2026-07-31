@@ -1400,19 +1400,40 @@ void MpvPlayer::RunPendingHdrOutput() {
   // to the state that produced it.
   g_message("MPV: output colour target peak=%s prim=%s trc=%s", peak.c_str(), primaries, curve);
 
+  // Dependencies first, peak last, matching the order kResetOrder already uses.
+  //
+  // What is established: with peak=200 and trc=srgb both applied, but peak
+  // written first while trc was still `auto`, the shadows moved (1 nit 22.3 ->
+  // 15.1) and the highlights did not - 400/700/1000 nits stayed within five code
+  // values. So the transfer took effect and no tone-map pass ran.
+  //
+  // The hypothesis for that, not yet confirmed: libmpv settles whether a
+  // tone-map pass is needed when the peak changes, and at that instant the
+  // target was still unknown, so it concluded there was nothing to map into. If
+  // reordering does not change the measured curve then this is wrong and the
+  // cause lies elsewhere - most likely the 0.40-vs-0.41 or GLES-vs-Vulkan gap
+  // against which the reference curve was taken.
   auto changes = std::make_shared<std::vector<PropertyChange>>();
-  changes->push_back({"target-peak", peak, applied_target_peak_});
-  changes->push_back({"target-prim", primaries, applied_target_prim_});
   changes->push_back({"target-trc", curve, applied_target_trc_});
+  changes->push_back({"target-prim", primaries, applied_target_prim_});
+  changes->push_back({"target-peak", peak, applied_target_peak_});
   ApplyPropertySequence(changes, 0, [this, changes, request](int error) {
     const bool ok = plezy::mpv_common::SetPropertyStatusSucceeded(error);
     // Only a fully applied set becomes the new rollback target; a failed one was
     // already unwound, and the unwinding updated these itself if it had to force
     // SDR.
     if (ok && !disposed_) {
-      applied_target_peak_ = (*changes)[0].value;
-      applied_target_prim_ = (*changes)[1].value;
-      applied_target_trc_ = (*changes)[2].value;
+      // Matched by name, not position: the order above is load-bearing and has
+      // to stay free to change without silently reassigning the wrong field.
+      for (const PropertyChange& change : *changes) {
+        if (change.name == "target-peak") {
+          applied_target_peak_ = change.value;
+        } else if (change.name == "target-prim") {
+          applied_target_prim_ = change.value;
+        } else if (change.name == "target-trc") {
+          applied_target_trc_ = change.value;
+        }
+      }
     }
     // This request's own outcome, to this request's own caller. The result names
     // what mpv is actually in now, which is what decides whether the caller's

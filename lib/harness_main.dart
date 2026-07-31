@@ -171,21 +171,38 @@ class _HarnessAppState extends State<_HarnessApp> {
       // their own paths above; everything else reaches mpv unchanged.
       //
       // Applied before open() so the first configured frame already has them.
+      //
+      // A malformed or rejected override aborts the leg, for the same reason
+      // PLEZY_HARNESS_TONEMAP does: these captures get labelled with the value
+      // that was asked for, and carrying on would file the default curve under
+      // whatever was requested. A silently wrong label is worse than no capture.
       final props = Platform.environment['PLEZY_HARNESS_MPV_PROPS'];
       if (props != null && props.isNotEmpty) {
         for (final pair in props.split(',')) {
           final split = pair.indexOf('=');
-          if (split <= 0) {
-            stdout.writeln('HARNESS_MPV_PROP_ERROR not name=value: $pair');
-            continue;
+          final name = split > 0 ? pair.substring(0, split).trim() : '';
+          final value = split > 0 ? pair.substring(split + 1).trim() : '';
+          String? failure;
+          if (name.isEmpty || value.isEmpty) {
+            failure = 'not name=value';
+          } else {
+            try {
+              await player.setProperty(name, value);
+              stdout.writeln('HARNESS_MPV_PROP $name=$value');
+            } catch (e) {
+              failure = '$e';
+            }
           }
-          final name = pair.substring(0, split).trim();
-          final value = pair.substring(split + 1).trim();
-          try {
-            await player.setProperty(name, value);
-            stdout.writeln('HARNESS_MPV_PROP $name=$value');
-          } catch (e) {
-            stdout.writeln('HARNESS_MPV_PROP_ERROR $name=$value: $e');
+          if (failure != null) {
+            stdout.writeln('HARNESS_MPV_PROP_ERROR $pair: $failure');
+            await player.dispose();
+            if (mounted) {
+              setState(() {
+                _player = null;
+                _status = 'bad PLEZY_HARNESS_MPV_PROPS: $pair';
+              });
+            }
+            return;
           }
         }
       }
