@@ -113,6 +113,56 @@ class LinuxPackageDepsGuardTest(unittest.TestCase):
         self.assertIn("libpipewire-0.3", result.stderr)
         self.assertIn("RUNTIME_PACKAGES", result.stderr)
 
+    def test_a_grouped_link_is_read_past_the_first_target(self) -> None:
+        # CMake happily takes several targets in one call. A parse that stopped at
+        # the first would wave the rest through while they sat on the link line.
+        cmake = self._mutate(
+            "runner/CMakeLists.txt",
+            "target_link_libraries(${BINARY_NAME} PRIVATE PkgConfig::EGL)",
+            "pkg_check_modules(PIPEWIRE REQUIRED IMPORTED_TARGET libpipewire-0.3)\n"
+            "target_link_libraries(${BINARY_NAME} PRIVATE PkgConfig::EGL PkgConfig::PIPEWIRE)",
+        )
+
+        result = self._run(**{"runner/CMakeLists.txt": cmake})
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("libpipewire-0.3", result.stderr)
+
+    def test_a_transitive_link_through_an_internal_target_is_followed(self) -> None:
+        # wayland_protocols already hands PkgConfig::WAYLAND_CLIENT to whatever
+        # links it. A static library's dependencies land on the consumer's link
+        # line, so stopping at the internal target would miss a real dependency.
+        cmake = self._mutate(
+            "runner/CMakeLists.txt",
+            "target_link_libraries(wayland_protocols PUBLIC PkgConfig::WAYLAND_CLIENT)",
+            "pkg_check_modules(PIPEWIRE REQUIRED IMPORTED_TARGET libpipewire-0.3)\n"
+            "target_link_libraries(wayland_protocols PUBLIC PkgConfig::WAYLAND_CLIENT "
+            "PkgConfig::PIPEWIRE)",
+        )
+
+        result = self._run(**{"runner/CMakeLists.txt": cmake})
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("libpipewire-0.3", result.stderr)
+
+    def test_dropping_the_direct_wayland_client_link_still_finds_it(self) -> None:
+        # The runner names wayland-client directly *and* gets it through
+        # wayland_protocols. Removing the direct link must not silence the guard,
+        # because the binary still links the library either way.
+        cmake = self._mutate(
+            "runner/CMakeLists.txt",
+            "target_link_libraries(${BINARY_NAME} PRIVATE PkgConfig::WAYLAND_CLIENT)\n",
+            "",
+        )
+        packages = self._mutate("packaging/build-packages.py", '"libwayland-client0",\n', "")
+
+        result = self._run(
+            **{"runner/CMakeLists.txt": cmake, "packaging/build-packages.py": packages}
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("links wayland-client but the deb package", result.stderr)
+
     def test_a_link_with_no_pkg_check_modules_is_rejected(self) -> None:
         cmake = self._mutate(
             "runner/CMakeLists.txt",

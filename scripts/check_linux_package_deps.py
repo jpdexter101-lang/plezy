@@ -75,13 +75,43 @@ def read(path: Path) -> str:
         return ""
 
 
+# Keywords that carry no target name.
+LINK_KEYWORDS = {"PRIVATE", "PUBLIC", "INTERFACE", "LINK_ONLY", "optimized", "debug", "general"}
+
+
+def link_graph(text: str) -> dict[str, list[str]]:
+    """target -> everything target_link_libraries() gives it, in order."""
+    graph: dict[str, list[str]] = {}
+    for match in re.finditer(r"target_link_libraries\(\s*([^\s)]+)\s*([^)]*)\)", text):
+        name = match.group(1).replace("${BINARY_NAME}", "BINARY")
+        tokens = [t for t in match.group(2).split() if t not in LINK_KEYWORDS]
+        graph.setdefault(name, []).extend(tokens)
+    return graph
+
+
 def linked_pkgconfig_targets(text: str) -> set[str]:
-    """PkgConfig:: targets linked into the runner executable."""
+    """Every PkgConfig:: target that reaches the runner's link line.
+
+    A static library hands its dependencies to whatever links it - CMake puts
+    even PRIVATE ones on the consumer's link line - so an internal target has to
+    be followed rather than treated as a leaf. Without that,
+    `wayland_protocols PUBLIC PkgConfig::WAYLAND_CLIENT` would be invisible here
+    the moment the runner stopped naming wayland-client directly itself.
+    """
+    graph = link_graph(text)
     targets: set[str] = set()
-    for match in re.finditer(
-        r"target_link_libraries\(\s*\$\{BINARY_NAME\}[^)]*?PkgConfig::(\w+)", text
-    ):
-        targets.add(match.group(1))
+    seen: set[str] = set()
+    queue = ["BINARY"]
+    while queue:
+        current = queue.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        for token in graph.get(current, []):
+            if token.startswith("PkgConfig::"):
+                targets.add(token[len("PkgConfig::") :])
+            elif token in graph:
+                queue.append(token)
     return targets
 
 
