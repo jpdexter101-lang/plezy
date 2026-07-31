@@ -115,6 +115,38 @@ class _HarnessAppState extends State<_HarnessApp> {
     }
   }
 
+  // Which side tone-maps, and against what peak, is decided by mpv options that
+  // leave no trace on screen: two very different curves look like "the video
+  // plane works". Reading the effective values back is the only way to tell a
+  // deliberate target from a default nobody chose - and the render API cannot
+  // discover the display for itself the way a windowed mpv does, so the answer
+  // here is not the answer `mpv` alone would give.
+  //
+  // Read after open() because the source-dependent ones are unset until a
+  // format is known.
+  Future<void> _reportColourState(Player player) async {
+    const names = <String>[
+      'target-peak',
+      'target-trc',
+      'target-prim',
+      'tone-mapping',
+      'hdr-compute-peak',
+      'video-params/gamma',
+      'video-params/primaries',
+      'video-params/sig-peak',
+      'video-params/max-luma',
+    ];
+    final parts = <String>[];
+    for (final name in names) {
+      try {
+        parts.add('$name=${await player.getProperty(name) ?? "-"}');
+      } catch (e) {
+        parts.add('$name=<error>');
+      }
+    }
+    stdout.writeln('HARNESS_COLOUR ${parts.join(' ')}');
+  }
+
   Future<void> _start() async {
     final media = Platform.environment['PLEZY_HARNESS_MEDIA'];
     if (media == null || media.isEmpty) {
@@ -168,6 +200,7 @@ class _HarnessAppState extends State<_HarnessApp> {
       stdout.writeln('HARNESS_OPENED $uri');
       final id = player.textureId;
       stdout.writeln('HARNESS_TEXTURE_ID $id');
+      await _reportColourState(player);
     } catch (e, st) {
       stdout.writeln('HARNESS_ERROR $e\n$st');
       // Clearing the field is what makes _status visible, so dispose through the
