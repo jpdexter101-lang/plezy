@@ -171,12 +171,10 @@ class WaylandVideoSurface {
   // `on_settled(token, true)` means Commit may proceed. It fires synchronously
   // when there is nothing to validate, so the caller must tolerate re-entry.
   //
-  // The token identifies *this* transition, and Commit and Abort ignore any other.
-  // Without it a transition that has settled but not yet committed — its mpv
-  // property request still in flight — could be replaced by a newer one, and the
-  // older request's completion would then commit the newer description alongside
-  // the older pixels. A token of zero means nothing was staged, so there is
-  // nothing to commit or abort.
+  // The token identifies *this* transition, and Commit and Abort ignore any other,
+  // so a settled-but-uncommitted transition whose mpv request is still in flight
+  // cannot be committed against a newer description. A token of zero means nothing
+  // was staged, so there is nothing to commit or abort.
   void BeginHdrTransition(bool describe, const HdrMetadata& metadata, std::function<void(uint64_t, bool)> on_settled);
 
   // Applies the transition named by `token`. Returns true when the plane should
@@ -208,7 +206,8 @@ class WaylandVideoSurface {
   // is described, or the two disagree for a frame.
   bool CanDescribeSource(const HdrMetadata& metadata) const;
 
-  bool hdr_requested() const { return hdr_requested_; }
+  // Whether a description is attached, i.e. whether the compositor is currently
+  // being told this plane carries an HDR curve.
   bool hdr_active() const { return hdr_active_; }
 
  private:
@@ -223,7 +222,7 @@ class WaylandVideoSurface {
   void ClearStagedDescription();
   // Tears the staged transition down unconditionally and tells whoever was
   // waiting that it will not be committed. The token-checked Abort delegates here;
-  // supersession and teardown call it directly.
+  // teardown and ForceUndescribed call it directly.
   void DiscardTransition();
   // Shared tail of the transition's outcome, whichever event delivered it.
   void SettleTransition(bool ok);
@@ -260,8 +259,8 @@ class WaylandVideoSurface {
 
   // wp_image_description_info_v1 has eleven events and every one of them must
   // be present in the listener. Only tf_named, primaries_named, luminances and
-  // target_luminance carry anything we use; the rest are deliberate no-ops
-  // rather than omissions.
+  // target_luminance carry anything we use, and icc_file has to close the fd it
+  // is handed; the remainder are deliberate no-ops rather than omissions.
   static void HandleInfoDone(void* data, wp_image_description_info_v1* info);
   static void HandleInfoIccFile(void* data, wp_image_description_info_v1* info, int32_t icc, uint32_t icc_size);
   static void HandleInfoPrimaries(
@@ -329,6 +328,9 @@ class WaylandVideoSurface {
   PreferredColorDescription preferred_;
   PreferredColorDescription pending_preferred_;
   std::function<void()> on_preferred_changed_;
+  // The committed source description, i.e. what the attached description was
+  // built from. Compared against a new request so an identical one is a no-op
+  // rather than a needless round-trip through the compositor.
   HdrMetadata metadata_;
   int depth_bits_ = 8;
   // supports_hdr_ is the aggregate gate; the three below are what the compositor
@@ -341,9 +343,6 @@ class WaylandVideoSurface {
   // What the compositor will accept in a luminance description. Consulted by
   // PlanHdrLuminance, which turns it plus the source into a legal request set.
   CompositorLuminanceSupport luminance_support_;
-  // Whether a description is currently wanted for the source in hand. Set only
-  // by SetHdr, from the instruction it was given.
-  bool hdr_requested_ = false;
   bool hdr_active_ = false;
 };
 

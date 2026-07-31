@@ -34,7 +34,7 @@ LINUX = Path(sys.argv[1]).resolve() if len(sys.argv) == 2 else ROOT / "linux"
 RUNNER_CMAKE = LINUX / "runner/CMakeLists.txt"
 PACKAGES_PY = LINUX / "packaging/build-packages.py"
 BUNDLE_SH = LINUX / "packaging/bundle-libs.sh"
-# pkg_check_modules for targets the runner links may live in either file.
+# pkg_check_modules for targets the runner links may live in any of these.
 CMAKE_FILES = (RUNNER_CMAKE, LINUX / "CMakeLists.txt", LINUX / "flutter/CMakeLists.txt")
 
 # pkg-config module -> the package that ships its runtime library, per distro.
@@ -44,6 +44,10 @@ RUNTIME_PACKAGES = {
     "gtk+-3.0": {"deb": "libgtk-3-0", "rpm": "gtk3", "pacman": "gtk3"},
     "mpv": {"deb": "libmpv2 | libmpv1", "rpm": "mpv-libs", "pacman": "mpv"},
     "epoxy": {"deb": "libepoxy0", "rpm": "libepoxy", "pacman": "libepoxy"},
+    # Reached through the `flutter` INTERFACE target rather than named by the
+    # runner, which is why the graph has to cross file boundaries to see them.
+    "glib-2.0": {"deb": "libglib2.0-0", "rpm": "glib2", "pacman": "glib2"},
+    "gio-2.0": {"deb": "libglib2.0-0", "rpm": "glib2", "pacman": "glib2"},
     "wayland-client": {
         "deb": "libwayland-client0",
         "rpm": "libwayland-client",
@@ -76,27 +80,44 @@ def read(path: Path) -> str:
 
 
 # Keywords that carry no target name.
-LINK_KEYWORDS = {"PRIVATE", "PUBLIC", "INTERFACE", "LINK_ONLY", "optimized", "debug", "general"}
+LINK_KEYWORDS = {"PRIVATE", "PUBLIC", "INTERFACE", "optimized", "debug", "general"}
+# Options CMake accepts between IMPORTED_TARGET and the module names, in any order.
+PKG_OPTIONS = ("REQUIRED", "QUIET", "GLOBAL", "NO_CMAKE_PATH", "NO_CMAKE_ENVIRONMENT_PATH")
+
+
+def strip_comments(text: str) -> str:
+    """A `#` comment containing `)` would otherwise truncate a call body.
+
+    That is the fail-open direction: every target after the comment vanishes and
+    the guard still exits 0, which is the whole bug class it exists to catch.
+    """
+    return re.sub(r"#[^\n]*", "", text)
+
+
+def link_token(raw: str) -> str:
+    """`$<LINK_ONLY:PkgConfig::X>` and `"PkgConfig::X"` both name PkgConfig::X."""
+    return re.sub(r"^\$<[^:]*:", "", raw.strip('"')).rstrip(">")
 
 
 def link_graph(text: str) -> dict[str, list[str]]:
     """target -> everything target_link_libraries() gives it, in order."""
     graph: dict[str, list[str]] = {}
-    for match in re.finditer(r"target_link_libraries\(\s*([^\s)]+)\s*([^)]*)\)", text):
+    for match in re.finditer(r"target_link_libraries\(\s*([^\s)]+)\s*([^)]*)\)", strip_comments(text)):
         name = match.group(1).replace("${BINARY_NAME}", "BINARY")
-        tokens = [t for t in match.group(2).split() if t not in LINK_KEYWORDS]
-        graph.setdefault(name, []).extend(tokens)
+        tokens = [link_token(t) for t in match.group(2).split()]
+        graph.setdefault(name, []).extend(t for t in tokens if t not in LINK_KEYWORDS)
     return graph
 
 
 def linked_pkgconfig_targets(text: str) -> set[str]:
     """Every PkgConfig:: target that reaches the runner's link line.
 
-    A static library hands its dependencies to whatever links it - CMake puts
-    even PRIVATE ones on the consumer's link line - so an internal target has to
-    be followed rather than treated as a leaf. Without that,
-    `wayland_protocols PUBLIC PkgConfig::WAYLAND_CLIENT` would be invisible here
-    the moment the runner stopped naming wayland-client directly itself.
+    A library hands its dependencies to whatever links it - CMake puts even
+    PRIVATE ones of a static library on the consumer's link line, and an
+    INTERFACE target exists only to propagate them - so an internal target has to
+    be followed rather than treated as a leaf. `wayland_protocols PUBLIC
+    PkgConfig::WAYLAND_CLIENT` and `flutter INTERFACE PkgConfig::GTK` are both
+    invisible otherwise, the latter across a file boundary.
     """
     graph = link_graph(text)
     targets: set[str] = set()
@@ -118,11 +139,16 @@ def linked_pkgconfig_targets(text: str) -> set[str]:
 def pkgconfig_modules() -> dict[str, str]:
     """CMake variable prefix -> pkg-config module name."""
     modules: dict[str, str] = {}
+    options = "|".join(PKG_OPTIONS)
     for path in CMAKE_FILES:
         if not path.is_file():
             continue
         for match in re.finditer(
-            r"pkg_check_modules\(\s*(\w+)\b[^)]*?IMPORTED_TARGET\s+([\w.+-]+)", read(path)
+            # The options may precede the module names, so skip any run of them
+            # rather than taking the first token and reporting `REQUIRED` as a
+            # package nobody ships.
+            r"pkg_check_modules\(\s*(\w+)\b[^)]*?IMPORTED_TARGET\s+(?:(?:" + options + r")\s+)*([\w.+-]+)",
+            strip_comments(read(path)),
         ):
             modules.setdefault(match.group(1), match.group(2))
     return modules
@@ -142,7 +168,10 @@ def declared_depends() -> dict[str, list[str]]:
     return {}
 
 
-runner = read(RUNNER_CMAKE)
+# Every file, not just the runner's: `flutter` is defined in flutter/CMakeLists.txt
+# and propagates GTK, GLIB and GIO to whatever links it, so a graph built from one
+# file treats it as a leaf and never sees them.
+cmake_text = "\n".join(read(path) for path in CMAKE_FILES if path.is_file())
 modules = pkgconfig_modules()
 depends = declared_depends()
 
@@ -158,11 +187,10 @@ for pattern in (r"libEGL\.so", r"libwayland.*\.so"):
         "the depends entries this guard demands may be wrong",
     )
 
-linked = linked_pkgconfig_targets(runner)
+linked = linked_pkgconfig_targets(cmake_text)
 require(
     bool(linked),
-    f"{RUNNER_CMAKE.name}: found no PkgConfig:: link on ${{BINARY_NAME}}; "
-    "the link-line parse is broken, not the build",
+    "found no PkgConfig:: link reaching ${BINARY_NAME}; the link-line parse is broken, not the build",
 )
 
 for target in sorted(linked):

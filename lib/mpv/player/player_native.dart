@@ -1017,18 +1017,20 @@ class PlayerNative extends PlayerBase {
 
   /// Whether this player can actually put HDR on screen right now.
   ///
-  /// Only Linux answers dynamically, and there it genuinely varies: the native
-  /// side requires a 10-bit plane, a compositor that advertises the source's
-  /// transfer function and BT.2020, and an output the compositor reports as
-  /// being in HDR. Moving the window to an SDR monitor changes the answer, so
-  /// this is a query and never cached.
+  /// Linux and Windows both answer from the real output, and on Linux it changes
+  /// under you: it needs a 10-bit plane, a compositor advertising the source's
+  /// transfer function and BT.2020, and an output the compositor reports as being
+  /// in HDR, so moving the window to an SDR monitor changes the answer. Neither
+  /// is cached for that reason.
   ///
-  /// Elsewhere the capability is a property of the platform, so the static
-  /// answer is the right one and no channel round trip is made.
+  /// iOS and macOS have no such query; there the capability really is a property
+  /// of the device.
+  @override
   Future<bool> isHdrOutputSupported() async {
-    if (_nativeCoreUnavailable) return false;
-    if (!Platform.isLinux) return Platform.isIOS || Platform.isMacOS || Platform.isWindows;
-    if (audioOnly) return false;
-    return await invoke<bool>('isHDRSupported') ?? false;
+    // No video plane without video, on any platform, so this precedes the
+    // platform question rather than sitting inside one branch of it.
+    if (_nativeCoreUnavailable || audioOnly) return false;
+    if (Platform.isLinux || Platform.isWindows) return await invoke<bool>('isHDRSupported') ?? false;
+    return Platform.isIOS || Platform.isMacOS;
   }
 }

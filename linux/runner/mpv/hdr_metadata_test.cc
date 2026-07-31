@@ -162,10 +162,17 @@ void TestEmptyMetadataSendsNothing() {
 // non-zero floor rather than silently becoming "unset".
 void TestMinLuminanceScaling() {
   EXPECT(mpv::ScaleMinLuminance(0.0001) == 1);
+  // Half a scaled unit. Without the rounding term this truncates to 0, i.e. the
+  // floor silently becomes "unset" instead of the smallest expressible value.
+  EXPECT(mpv::ScaleMinLuminance(0.00005) == 1);
   EXPECT(mpv::ScaleMinLuminance(0.005) == 50);
   EXPECT(mpv::ScaleMinLuminance(1.0) == 10000);
   EXPECT(mpv::ScaleMinLuminance(0.0) == 0);
   EXPECT(mpv::ScaleMinLuminance(-1.0) == 0);
+  // An out-of-range float-to-uint32 conversion is undefined behaviour rather than
+  // a wrap, and mpv's video-params is untrusted input, so saturating is part of
+  // the contract rather than an implementation detail.
+  EXPECT(mpv::ScaleMinLuminance(1e30) == 4294967295u);
 }
 
 // The range predicate itself: strictly above min L, at or below max L.
@@ -177,8 +184,20 @@ void TestRangePredicateBoundaries() {
   // min L = 5 nits: 5 is not strictly greater, 6 is.
   EXPECT(!mpv::LuminanceInMasteringRange(5, 50000, 1000));
   EXPECT(mpv::LuminanceInMasteringRange(6, 50000, 1000));
-  // A corrupt value must not wrap the scaled multiply into a false pass.
+  // An absurd value is rejected by the max bound, before the scaled multiply.
   EXPECT(!mpv::LuminanceInMasteringRange(4000000000u, 1, 1000));
+}
+
+// The mastering floor is a bound in its own right: on version 1 a light level at
+// or below min L is invalid_luminance just as surely as one above max L. This
+// drives it through PlanHdrLuminance rather than the predicate alone, so it
+// covers the wiring of mastering_min_scaled into the range test.
+void TestLightLevelsBelowTheMasteringFloorAreDropped() {
+  const auto plan = mpv::PlanHdrLuminance(Metadata(3, 2, 1000, 5.0), Support(true, 1));
+  EXPECT(plan.send_mastering);
+  EXPECT(plan.mastering_min_scaled == 50000);
+  EXPECT(!plan.send_max_cll);
+  EXPECT(!plan.send_max_fall);
 }
 
 // HLG's primary colour volume tops out at 1000 nits, not PQ's 10000. A 4000-nit
@@ -195,6 +214,20 @@ void TestHlgLightLevelsBoundedAtThousand() {
   const auto pq = mpv::PlanHdrLuminance(Metadata(4000, 400, 0, 0.0, mpv::SourceTransfer::kPq), Support(false, 1));
   EXPECT(pq.send_max_cll);
   EXPECT(pq.max_cll == 4000);
+}
+
+// Both interface versions must agree about the same stream. extended_target_volume
+// lets the mastering range reach 10000 even for HLG, so a version-1 range check
+// alone would accept a 2000-nit HLG light level that version 2 refuses — the
+// curve's own volume bound has to apply regardless of version.
+void TestVolumeCapIsVersionIndependent() {
+  const auto metadata = Metadata(2000, 1500, 4000, 0.01, mpv::SourceTransfer::kHlg);
+  const auto v1 = mpv::PlanHdrLuminance(metadata, Support(true, 1, true));
+  const auto v2 = mpv::PlanHdrLuminance(metadata, Support(true, 2, true));
+  EXPECT(!v1.send_max_cll);
+  EXPECT(!v2.send_max_cll);
+  EXPECT(v1.send_max_cll == v2.send_max_cll);
+  EXPECT(v1.send_max_fall == v2.send_max_fall);
 }
 
 // Exactly 1000 is inside HLG's volume; 1001 is not.
@@ -432,8 +465,10 @@ int main() {
   TestEmptyMetadataSendsNothing();
   TestMinLuminanceScaling();
   TestRangePredicateBoundaries();
+  TestLightLevelsBelowTheMasteringFloorAreDropped();
   TestHlgLightLevelsBoundedAtThousand();
   TestHlgVolumeBoundary();
+  TestVolumeCapIsVersionIndependent();
   TestHlgLightLevelsBoundedOnV2();
   TestHlgMasteringClampedWithoutExtendedVolume();
   TestPqMasteringUnaffectedByExtendedVolumeGate();

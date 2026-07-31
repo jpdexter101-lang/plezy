@@ -20,7 +20,8 @@ bool Fail(std::string* error, const char* message) {
   return false;
 }
 
-// What the compositor answered while its globals were being bound.
+// Scratch state for the bootstrap only: the registry and manager listeners fill
+// it across a couple of roundtrips, and BindGlobals copies out what it needs.
 struct RegistryTarget {
   wl_subcompositor* subcompositor = nullptr;
   wp_color_manager_v1* color_manager = nullptr;
@@ -269,7 +270,6 @@ bool WaylandVideoSurface::Create(GtkWidget* view, std::string* error) {
     Destroy();
     return Fail(error, "Failed to create the video wl_subsurface");
   }
-  // Below the Flutter surface, and independent of its frame loop.
   wl_subsurface_place_below(subsurface_, parent);
   wl_subsurface_set_desync(subsurface_);
 
@@ -658,14 +658,17 @@ void WaylandVideoSurface::BeginHdrTransition(
     if (on_settled) on_settled(0, !describe);
     return;
   }
-  // A transition already staged is superseded, and its waiter is told so rather
-  // than dropped.
-  if (transition_staged_) DiscardTransition();
+  // One at a time; the caller serializes them. Superseding here cannot be made
+  // safe: the displaced waiter is told synchronously, and anything it stages in
+  // response would be clobbered as this call continues.
+  if (transition_staged_) {
+    if (on_settled) on_settled(0, false);
+    return;
+  }
 
-  // Nothing would change: same answer, same source. Report settled without
-  // holding Present() or building anything, which is what keeps the per-seek
-  // playback-restart path free. Token zero: there is nothing to commit.
-  if (describe == hdr_active_ && SameMetadata(metadata_, metadata)) {
+  // Metadata matters only while described; otherwise every SDR source change
+  // would stage a no-op transition that holds Present() and forces a render.
+  if (describe == hdr_active_ && (!describe || SameMetadata(metadata_, metadata))) {
     if (on_settled) on_settled(0, true);
     return;
   }
@@ -688,10 +691,10 @@ void WaylandVideoSurface::BeginHdrTransition(
 }
 
 bool WaylandVideoSurface::CommitHdrTransition(uint64_t token) {
-  // A stale token means this transition was superseded while its caller's mpv
-  // request was still in flight. Committing then would pair the newer
-  // description with the older pixels, which is exactly what the token exists to
-  // prevent. Token zero is the "nothing was staged" case.
+  // A stale token means the transition was torn down — teardown, or a forced
+  // undescribe — while its caller's mpv request was still in flight. Committing
+  // then would attach a description the plane no longer has pixels for. Token
+  // zero is the "nothing was staged" case.
   if (!transition_staged_ || token == 0 || token != transition_token_) return false;
 
   const bool describe = staged_describe_;
@@ -706,16 +709,12 @@ bool WaylandVideoSurface::CommitHdrTransition(uint64_t token) {
     // pending state now carries the description until the next commit.
     wp_color_management_surface_v1_set_image_description(
         color_surface_, staged_description_, WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL);
-    hdr_requested_ = true;
     hdr_active_ = true;
     g_message("MPV video plane: image description attached");
   } else if (hdr_active_) {
     wp_color_management_surface_v1_unset_image_description(color_surface_);
-    hdr_requested_ = false;
     hdr_active_ = false;
     g_message("MPV video plane: image description cleared");
-  } else {
-    hdr_requested_ = false;
   }
 
   ClearStagedDescription();
@@ -759,11 +758,9 @@ void WaylandVideoSurface::DiscardTransition() {
 bool WaylandVideoSurface::ForceUndescribed() {
   DiscardTransition();
   if (color_surface_ == nullptr || !hdr_active_) {
-    hdr_requested_ = false;
     return false;
   }
   wp_color_management_surface_v1_unset_image_description(color_surface_);
-  hdr_requested_ = false;
   hdr_active_ = false;
   g_warning("MPV video plane: description withdrawn, mpv's colour space had to be forced to SDR");
   // Lands on the child surface's next commit, so the caller has to present for it
@@ -901,8 +898,14 @@ void WaylandVideoSurface::Destroy() {
     wp_color_manager_v1_destroy(color_manager_);
     color_manager_ = nullptr;
   }
+  // Every advertised capability, not just the aggregate: CanDescribeSource()
+  // reads the per-curve flags directly, and a partial recreate would otherwise
+  // consult what the *previous* compositor connection offered.
   supports_hdr_ = false;
-  hdr_requested_ = false;
+  supports_pq_ = false;
+  supports_hlg_ = false;
+  supports_bt2020_ = false;
+  luminance_support_ = CompositorLuminanceSupport();
   hdr_active_ = false;
   depth_bits_ = 8;
   if (subsurface_ != nullptr) {
@@ -924,8 +927,15 @@ void WaylandVideoSurface::Destroy() {
   egl_config_ = nullptr;
   egl_display_ = EGL_NO_DISPLAY;
   view_ = nullptr;
+  // All of it, not just the size: SetRect() early-returns when nothing changed,
+  // so stale geometry surviving here would leave a recreated subsurface never
+  // positioned or scaled. The zeroed size alone happens to prevent that today,
+  // which is not a thing to rely on.
+  x_ = 0;
+  y_ = 0;
   width_ = 0;
   height_ = 0;
+  scale_ = 1;
   visible_ = false;
   buffer_attached_ = false;
 }

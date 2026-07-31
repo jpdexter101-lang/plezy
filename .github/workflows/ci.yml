@@ -646,7 +646,7 @@ jobs:
           ls -l
           for extension in deb rpm pkg.tar.zst; do
             test -f "plezy-linux-x64.$extension" || {
-              echo "::error::plezy-linux-x64.$extension was not produced" >&2
+              echo "::error::plezy-linux-x64.$extension was not produced"
               exit 1
             }
           done
@@ -663,7 +663,7 @@ jobs:
           check() {
             case "$2" in
               *"$3"*) ;;
-              *) echo "::error::the $1 package does not require $3, which the video plane links" >&2
+              *) echo "::error::the $1 package does not require $3, which the video plane links"
                  status=1 ;;
             esac
           }

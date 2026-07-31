@@ -365,13 +365,7 @@ class MpvPlayer {
   void RunPendingHdrOutput();
 
   /// A desired output colour space, waiting its turn, with the callback that
-  /// asked for it.
-  ///
-  /// Requests are queued rather than coalesced. Callers commit their own state on
-  /// success, so each must learn the outcome of *its* request; folding several
-  /// into one and broadcasting a single result would tell a caller its change
-  /// landed when a different one did. Strict ordering also means the last
-  /// success is what mpv holds, so no epoch bookkeeping is needed.
+  /// asked for it. SetHdrOutput explains why each keeps its own callback.
   struct HdrOutputRequest {
     SourceTransfer transfer = SourceTransfer::kSdr;
     uint32_t peak_nits = 0;

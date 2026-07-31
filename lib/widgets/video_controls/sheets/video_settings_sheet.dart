@@ -14,7 +14,6 @@ import 'package:provider/provider.dart';
 import '../../../models/shader_preset.dart';
 import '../../../media/playback_rate.dart';
 import '../../../mpv/mpv.dart';
-import '../../../mpv/player/player_native.dart';
 import '../../../providers/shader_provider.dart';
 import '../../../services/file_picker_service.dart';
 import '../../../services/settings_service.dart';
@@ -276,6 +275,7 @@ class _VideoSettingsSheetState extends State<VideoSettingsSheet> {
   late double _zoomScale;
   String _dvConversionMode = 'auto';
   int _dvConversionWriteGeneration = 0;
+  int _hdrToneMappingWriteGeneration = 0;
   // Linux only, and answered by the native side. Starts false so the toggle
   // never flashes into view on an output that cannot carry HDR.
   bool _linuxHdrSupported = false;
@@ -329,7 +329,6 @@ class _VideoSettingsSheetState extends State<VideoSettingsSheet> {
   Future<void> _loadLinuxHdrSupport() async {
     if (!Platform.isLinux || widget.supportsHdrControl != null) return;
     final player = widget.player;
-    if (player is! PlayerNative) return;
     final supported = await player.isHdrOutputSupported();
     if (!mounted || player != widget.player || supported == _linuxHdrSupported) return;
     setState(() {
@@ -339,11 +338,15 @@ class _VideoSettingsSheetState extends State<VideoSettingsSheet> {
 
   void _setHdrToneMapping(HdrToneMapping mode) {
     final targetPlayer = widget.player;
+    // The tiles stay tappable until close() runs, so two picks can be in flight.
+    // The native side happens to queue HDR transactions in order, but that is not
+    // an invariant this file can see: last write wins locally instead.
+    final generation = ++_hdrToneMappingWriteGeneration;
     unawaited(() async {
       try {
         await targetPlayer.setProperty('hdr-tone-mapping', mode.name);
         await SettingsService.instance.write(SettingsService.hdrToneMapping, mode);
-        if (!mounted || targetPlayer != widget.player) return;
+        if (!mounted || generation != _hdrToneMappingWriteGeneration || targetPlayer != widget.player) return;
         setState(() {
           _hdrToneMapping = mode;
         });

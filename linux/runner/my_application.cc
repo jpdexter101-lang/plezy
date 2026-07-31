@@ -65,8 +65,7 @@ static void my_application_activate(GApplication* application) {
 
   gtk_window_set_default_size(window, 1280, 720);
 
-  // Create the Flutter view. On Wayland it composites over the native mpv
-  // video plane, so it must be able to carry alpha.
+  // Create the Flutter view.
   g_autoptr(FlDartProject) project = fl_dart_project_new();
   fl_dart_project_set_dart_entrypoint_arguments(project, self->dart_entrypoint_arguments);
 

@@ -759,6 +759,9 @@ abstract class PlayerBase with PlayerStreamControllersMixin implements Player {
   Future<void> updateFrame() async {}
 
   @override
+  Future<bool> isHdrOutputSupported() async => false;
+
+  @override
   Future<bool> setVideoFrameRate(
     double fps,
     int durationMs, {

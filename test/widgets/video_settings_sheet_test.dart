@@ -171,6 +171,29 @@ void main() {
     expect(find.text('HDR Tone Mapping'), findsNothing);
   });
 
+  // With supportsHdrControl left null the sheet asks the player, which is the
+  // path that actually ships on Linux. The two above inject the answer and so
+  // only cover the gate, not the probe behind it.
+  testWidgets('a Linux player reporting no HDR output hides the controls', (tester) async {
+    final player = _FakeSettingsPlayer(hdrOutputSupported: false);
+    await _pumpSheet(tester, player: player);
+
+    await tester.scrollUntilVisible(find.text('Auto-Play Next'), 500, scrollable: find.byType(Scrollable).first);
+
+    expect(find.text('HDR'), findsNothing);
+    expect(find.text('HDR Tone Mapping'), findsNothing);
+  }, skip: !Platform.isLinux);
+
+  testWidgets('a Linux player reporting an HDR output reveals the controls', (tester) async {
+    final player = _FakeSettingsPlayer(hdrOutputSupported: true);
+    await _pumpSheet(tester, player: player);
+
+    await tester.scrollUntilVisible(find.text('HDR'), 500, scrollable: find.byType(Scrollable).first);
+
+    expect(find.text('HDR'), findsOneWidget);
+    expect(find.text('HDR Tone Mapping'), findsOneWidget);
+  }, skip: !Platform.isLinux);
+
   testWidgets('the tone-mapping choice writes the mode before persisting it', (tester) async {
     final writes = <(String, String)>[];
     final player = _FakeSettingsPlayer(onSetProperty: (name, value) async => writes.add((name, value)));
@@ -231,7 +254,7 @@ Future<void> _pumpSheet(
   await tester.pumpAndSettle();
 }
 
-Future<void> _pumpHostedSheet(WidgetTester tester, Player player, {bool? supportsHdrControl}) async {
+Future<void> _pumpHostedSheet(WidgetTester tester, Player player) async {
   await tester.pumpWidget(
     MaterialApp(
       theme: ThemeData(extensions: const [testMonoTokensAnimated]),
@@ -243,7 +266,6 @@ Future<void> _pumpHostedSheet(WidgetTester tester, Player player, {bool? support
                 OverlaySheetController.of(context).show<void>(
                   builder: (_) => VideoSettingsSheet(
                     player: player,
-                    supportsHdrControl: supportsHdrControl,
                     trackControlsState: const TrackControlsState(canControl: true),
                   ),
                 ),
@@ -260,7 +282,7 @@ Future<void> _pumpHostedSheet(WidgetTester tester, Player player, {bool? support
 }
 
 class _FakeSettingsPlayer implements Player {
-  _FakeSettingsPlayer({this.onSetProperty, this.onSetRate})
+  _FakeSettingsPlayer({this.onSetProperty, this.onSetRate, this.hdrOutputSupported = false})
     : _streams = PlayerStreams(
         playing: const Stream<bool>.empty(),
         completed: const Stream<bool>.empty(),
@@ -285,6 +307,10 @@ class _FakeSettingsPlayer implements Player {
   final PlayerStreams _streams;
   final Future<void> Function(String name, String value)? onSetProperty;
   final Future<void> Function(double rate)? onSetRate;
+  final bool hdrOutputSupported;
+
+  @override
+  Future<bool> isHdrOutputSupported() async => hdrOutputSupported;
 
   @override
   PlayerState get state => const PlayerState();

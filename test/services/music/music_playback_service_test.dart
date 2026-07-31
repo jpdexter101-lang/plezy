@@ -56,6 +56,10 @@ class _CallGate {
 /// In-memory audio player: records calls, exposes manual stream controllers
 /// so tests drive transitions/completion/errors deterministically.
 class FakePlayer implements Player {
+  // Audio only; there is no video output to carry HDR.
+  @override
+  Future<bool> isHdrOutputSupported() async => false;
+
   final playingCtrl = StreamController<bool>.broadcast(sync: true);
   final completedCtrl = StreamController<bool>.broadcast(sync: true);
   final bufferingCtrl = StreamController<bool>.broadcast(sync: true);

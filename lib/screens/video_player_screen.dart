@@ -1200,8 +1200,12 @@ class VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindin
         await currentPlayer.setAudioPassthrough(settingsService.read(SettingsService.audioPassthrough));
       }
 
-      // Linux only, and set before hdr-enabled so the first image description is
-      // already built for the chosen mode.
+      // Set before hdr-enabled so the first image description is already built
+      // for the chosen mode. Unlike hdr-enabled below, every failure here is
+      // swallowed: the property only exists on the Wayland video plane, so the
+      // X11/FlTextureGL fallback rejects it as an unknown mpv property, with no
+      // code to tell that apart, and a tone-mapping preference is never a reason
+      // to fail playback.
       if (Platform.isLinux) {
         final toneMapping = settingsService.read(SettingsService.hdrToneMapping);
         try {

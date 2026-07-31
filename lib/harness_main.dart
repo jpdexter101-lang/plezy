@@ -6,7 +6,12 @@
 // Run with:
 //   PLEZY_HARNESS_MEDIA=/path/to/file.mp4 PLEZY_HARNESS_SECONDS=40 ./plezy
 //
-// Set PLEZY_HARNESS_MPV_LOG=v (or debug) for mpv's own log stream.
+// Optional knobs:
+//   PLEZY_HARNESS_MPV_LOG=v|debug             mpv's own log stream
+//   PLEZY_HARNESS_HDR=1                       request HDR passthrough
+//   PLEZY_HARNESS_TONEMAP=compositor|player   which side tone-maps; the A/B leg
+//   PLEZY_HARNESS_INSET=<px>                  toggles a padding every 6s, so the
+//                                             plane has to move, not just resize
 import 'dart:async';
 import 'dart:io';
 
@@ -103,7 +108,7 @@ class _HarnessAppState extends State<_HarnessApp> {
       final paused = await player.getProperty('pause');
       final dropped = await player.getProperty('frame-drop-count');
       final decoded = await player.getProperty('decoder-frame-drop-count');
-      final texture = player is PlayerBase ? player.textureId : null;
+      final texture = player.textureId;
       stdout.writeln('PROBE time-pos=$pos pause=$paused drops=$dropped dec_drops=$decoded texture=$texture');
     } catch (e) {
       stdout.writeln('PROBE_ERROR $e');
@@ -138,7 +143,16 @@ class _HarnessAppState extends State<_HarnessApp> {
           stdout.writeln('HARNESS_TONEMAP $toneMapping');
         } catch (e) {
           stdout.writeln('HARNESS_TONEMAP_ERROR $e');
-          setState(() => _status = 'bad PLEZY_HARNESS_TONEMAP: $toneMapping');
+          // build() only shows _status while there is no player, and one was
+          // assigned above. Without clearing it a deliberate abort renders as an
+          // empty transparent window, i.e. indistinguishable from a hang.
+          await player.dispose();
+          if (mounted) {
+            setState(() {
+              _player = null;
+              _status = 'bad PLEZY_HARNESS_TONEMAP: $toneMapping';
+            });
+          }
           return;
         }
       }
@@ -152,11 +166,20 @@ class _HarnessAppState extends State<_HarnessApp> {
       }
       await player.open(Media(uri));
       stdout.writeln('HARNESS_OPENED $uri');
-      final id = player is PlayerBase ? player.textureId : null;
+      final id = player.textureId;
       stdout.writeln('HARNESS_TEXTURE_ID $id');
     } catch (e, st) {
       stdout.writeln('HARNESS_ERROR $e\n$st');
-      setState(() => _status = 'error: $e');
+      // Clearing the field is what makes _status visible, so dispose through the
+      // local first or the only reference to the player is gone.
+      final abandoned = _player;
+      await abandoned?.dispose();
+      if (mounted) {
+        setState(() {
+          _player = null;
+          _status = 'error: $e';
+        });
+      }
     }
   }
 
@@ -167,6 +190,7 @@ class _HarnessAppState extends State<_HarnessApp> {
     _quitTimer?.cancel();
     _insetTimer?.cancel();
     SchedulerBinding.instance.removeTimingsCallback(_onFrames);
+    unawaited(_player?.dispose() ?? Future<void>.value());
     super.dispose();
   }
 

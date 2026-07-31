@@ -196,12 +196,18 @@ inline HdrLuminancePlan PlanHdrLuminance(const HdrMetadata& metadata, const Comp
   const uint32_t range_max = plan.send_mastering ? plan.mastering_max : volume_max;
   const uint32_t range_min_scaled = plan.send_mastering ? plan.mastering_min_scaled : 0;
 
-  // Version 1 requires both inside that range; version 2 dropped the
-  // requirement but the curve still has no code point above its own volume
-  // maximum. Drop the offending light level rather than the mastering range:
-  // mastering metadata is the more trustworthy of the two, and dropping max_cll
-  // leaves the compositor falling back to the mastering maximum, which is the
-  // better answer anyway.
+  // The curve has no code point above its own volume maximum, which is true of
+  // both interface versions: with extended_target_volume the mastering range may
+  // legally reach 10000 even for HLG, so range_max alone would let a v1
+  // compositor accept an HLG light level of 2000 that a v2 one refuses. Drop the
+  // offending light level rather than the mastering range: mastering metadata is
+  // the more trustworthy of the two, and dropping max_cll leaves the compositor
+  // falling back to the mastering maximum, which is the better answer anyway.
+  if (plan.send_max_cll && plan.max_cll > volume_max) plan.send_max_cll = false;
+  if (plan.send_max_fall && plan.max_fall > volume_max) plan.send_max_fall = false;
+
+  // Version 1 additionally requires both to sit inside the mastering range;
+  // version 2 dropped that.
   if (support.interface_version < 2) {
     if (plan.send_max_cll && !LuminanceInMasteringRange(plan.max_cll, range_min_scaled, range_max)) {
       plan.send_max_cll = false;
@@ -209,9 +215,6 @@ inline HdrLuminancePlan PlanHdrLuminance(const HdrMetadata& metadata, const Comp
     if (plan.send_max_fall && !LuminanceInMasteringRange(plan.max_fall, range_min_scaled, range_max)) {
       plan.send_max_fall = false;
     }
-  } else {
-    if (plan.send_max_cll && plan.max_cll > volume_max) plan.send_max_cll = false;
-    if (plan.send_max_fall && plan.max_fall > volume_max) plan.send_max_fall = false;
   }
 
   // Every version requires max_fall <= max_cll, but only while *both* are set,

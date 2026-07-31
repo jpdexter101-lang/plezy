@@ -13,8 +13,14 @@ using PlayerPtr = std::unique_ptr<mpv::MpvPlayer>;
 using VideoSurfacePtr = std::unique_ptr<mpv::WaylandVideoSurface>;
 
 // One queued HDR transaction: what to apply, and who to tell when it settles.
+//
+// `mode` is only the caller's when it *is* the mode request. Anything else
+// inherits whatever is in force at the moment its turn comes: a mode captured at
+// enqueue time could have been refused since, and applying it then would put a
+// curve on screen that Dart has already been told did not take.
 struct PendingHdrRequest {
   bool allow = false;
+  bool inherit_mode = true;
   mpv::HdrToneMapping mode = mpv::HdrToneMapping::kCompositor;
   std::function<void(int)> done;
 };
@@ -33,7 +39,7 @@ struct _MpvPlugin {
   MpvTexture* texture;  // owned via GObject ref
   // Non-null when video goes to a native Wayland plane below the Flutter
   // surface instead of through a Flutter texture. Mutually exclusive with
-  // |texture|; see mpv_plugin_start_video().
+  // |texture|; see try_start_video_plane().
   VideoSurfacePtr video_surface;
   // Set when the plane must be redrawn even though mpv has no new frame -
   // after a resize or after becoming visible, where the buffer on screen is
@@ -92,6 +98,14 @@ struct _MpvPlugin {
   guint ready_timeout_source_id;
 };
 
+// g_type_create_instance zeroes the instance and runs no constructor, so the
+// member initialisers above never execute: every scalar starts at zero and
+// nothing else assigns these. kCompositor has to *be* zero for that to land on
+// the intended default.
+static_assert(
+    static_cast<int>(mpv::HdrToneMapping::kCompositor) == 0,
+    "MpvPlugin's zeroed instance memory must decode as kCompositor");
+
 G_DEFINE_TYPE(MpvPlugin, mpv_plugin, G_TYPE_OBJECT)
 
 // Forward declarations
@@ -101,7 +115,8 @@ static mpv::HdrMetadata read_source_hdr_metadata(MpvPlugin* self);
 static void apply_hdr_state(MpvPlugin* self, bool allow, mpv::HdrToneMapping mode, std::function<void(int)> done);
 static void request_hdr_reapply(MpvPlugin* self);
 static void run_next_hdr_transaction(MpvPlugin* self);
-static void submit_hdr_transaction(
+static void submit_hdr_transaction(MpvPlugin* self, bool allow, std::function<void(int)> done);
+static void submit_hdr_mode_transaction(
     MpvPlugin* self, bool allow, mpv::HdrToneMapping mode, std::function<void(int)> done);
 
 // Events reach Dart unchanged; this only watches them go past. A playback
@@ -431,15 +446,32 @@ static void run_next_hdr_transaction(MpvPlugin* self) {
   auto request = std::make_shared<PendingHdrRequest>(std::move(self->hdr_queue.front()));
   self->hdr_queue.pop_front();
   self->hdr_transaction_in_flight = true;
-  apply_hdr_state(self, request->allow, request->mode, [self, request](int error) {
+  // Resolved here rather than at enqueue, so a mode that has since been refused
+  // is not applied on this request's back.
+  const mpv::HdrToneMapping mode = request->inherit_mode ? self->hdr_tone_mapping_desired : request->mode;
+  apply_hdr_state(self, request->allow, mode, [self, request](int error) {
     if (request->done) request->done(error);
     // Only now, with the surface unstaged and mpv settled, may the next one start.
     run_next_hdr_transaction(self);
   });
 }
 
-// Queues a transaction on behalf of a caller that needs its own outcome.
-static void submit_hdr_transaction(
+// Queues a transaction that carries whatever tone-mapping mode is in force when
+// its turn comes. For everything that is not itself a mode change.
+static void submit_hdr_transaction(MpvPlugin* self, bool allow, std::function<void(int)> done) {
+  if (self->video_surface == nullptr || self->player == nullptr) {
+    if (done) done(MPV_ERROR_UNINITIALIZED);
+    return;
+  }
+  PendingHdrRequest request;
+  request.allow = allow;
+  request.done = std::move(done);
+  self->hdr_queue.push_back(std::move(request));
+  if (!self->hdr_transaction_in_flight) run_next_hdr_transaction(self);
+}
+
+// Queues the mode change itself, which is the one request whose mode is its own.
+static void submit_hdr_mode_transaction(
     MpvPlugin* self, bool allow, mpv::HdrToneMapping mode, std::function<void(int)> done) {
   if (self->video_surface == nullptr || self->player == nullptr) {
     if (done) done(MPV_ERROR_UNINITIALIZED);
@@ -447,6 +479,7 @@ static void submit_hdr_transaction(
   }
   PendingHdrRequest request;
   request.allow = allow;
+  request.inherit_mode = false;
   request.mode = mode;
   request.done = std::move(done);
   self->hdr_queue.push_back(std::move(request));
@@ -463,7 +496,7 @@ static void request_hdr_reapply(MpvPlugin* self) {
     self->hdr_reapply_pending = true;
     return;
   }
-  submit_hdr_transaction(self, self->hdr_wanted != FALSE, self->hdr_tone_mapping_desired, nullptr);
+  submit_hdr_transaction(self, self->hdr_wanted != FALSE, nullptr);
 }
 
 // Re-applies the current request when the compositor's preferred description
@@ -873,24 +906,25 @@ static void mpv_plugin_handle_method_call(FlMethodChannel* channel, FlMethodCall
             self->hdr_tone_mapping_desired = requested;
             const uint64_t serial = ++self->hdr_mode_request_serial;
             g_object_ref(method_call);
-            submit_hdr_transaction(self, self->hdr_wanted != FALSE, requested, [self, method_call, serial](int error) {
-              g_autoptr(FlMethodResponse) async_response = nullptr;
-              if (plezy::mpv_common::SetPropertyStatusSucceeded(error)) {
-                async_response = FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
-              } else {
-                // Hand the desire back to whatever is actually in force, read
-                // live rather than captured: an intervening request may have
-                // committed since. Skipped if a newer request already claimed
-                // the desire.
-                if (self->hdr_mode_request_serial == serial) {
-                  self->hdr_tone_mapping_desired = self->hdr_tone_mapping;
-                }
-                async_response = FL_METHOD_RESPONSE(fl_method_error_response_new(
-                    plezy::mpv_common::kSetPropertyFailedCode, mpv_error_string(error), nullptr));
-              }
-              fl_method_call_respond(method_call, async_response, nullptr);
-              g_object_unref(method_call);
-            });
+            submit_hdr_mode_transaction(
+                self, self->hdr_wanted != FALSE, requested, [self, method_call, serial](int error) {
+                  g_autoptr(FlMethodResponse) async_response = nullptr;
+                  if (plezy::mpv_common::SetPropertyStatusSucceeded(error)) {
+                    async_response = FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
+                  } else {
+                    // Hand the desire back to whatever is actually in force, read
+                    // live rather than captured: an intervening request may have
+                    // committed since. Skipped if a newer request already claimed
+                    // the desire.
+                    if (self->hdr_mode_request_serial == serial) {
+                      self->hdr_tone_mapping_desired = self->hdr_tone_mapping;
+                    }
+                    async_response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+                        plezy::mpv_common::kSetPropertyFailedCode, mpv_error_string(error), nullptr));
+                  }
+                  fl_method_call_respond(method_call, async_response, nullptr);
+                  g_object_unref(method_call);
+                });
             return;
           }
           response = FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
@@ -906,7 +940,7 @@ static void mpv_plugin_handle_method_call(FlMethodChannel* channel, FlMethodCall
               "HDR_UNSUPPORTED", "This compositor, video plane or output cannot carry HDR", nullptr));
         } else {
           g_object_ref(method_call);
-          submit_hdr_transaction(self, enabled, self->hdr_tone_mapping_desired, [method_call](int error) {
+          submit_hdr_transaction(self, enabled, [method_call](int error) {
             g_autoptr(FlMethodResponse) async_response = nullptr;
             if (plezy::mpv_common::SetPropertyStatusSucceeded(error)) {
               async_response = FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
@@ -1019,18 +1053,10 @@ static void mpv_plugin_handle_method_call(FlMethodChannel* channel, FlMethodCall
       response = FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
     }
   } else if (strcmp(method, "isHDRSupported") == 0) {
-    // Two independent conditions, and both must hold. supports_hdr() is about
-    // this client: a 10-bit plane, a colour-managed surface, and a compositor
-    // that advertises PQ / BT.2020. output_is_hdr() is about the display: the
-    // compositor's preferred description for the surface is PQ, which is only
-    // true when the output is genuinely in HDR.
-    //
-    // The second is what stops the app offering an HDR toggle on an SDR panel,
-    // where enabling it only invites the compositor to tone-map a plane that
-    // never needed to be PQ in the first place.
-    const gboolean supported =
-        self->video_surface && self->video_surface->supports_hdr() && self->video_surface->output_is_hdr();
-    response = FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_bool(supported)));
+    // The output half of the gate is what stops the app offering an HDR toggle
+    // on an SDR panel, where enabling it only invites the compositor to tone-map
+    // a plane that never needed to be PQ in the first place.
+    response = FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_bool(hdr_available(self))));
   } else if (strcmp(method, "setVideoRect") == 0) {
     if (!self->video_surface) {
       // Texture mode places video through the Flutter widget tree instead.

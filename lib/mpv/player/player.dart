@@ -261,6 +261,14 @@ abstract class Player {
   /// On other platforms, this is a no-op.
   Future<void> updateFrame();
 
+  /// Whether this player's video output can currently carry HDR.
+  ///
+  /// A query rather than a constant because on Linux it genuinely varies: the
+  /// native side needs a 10-bit plane, a compositor advertising the source's
+  /// transfer function and BT.2020, and an output the compositor reports as
+  /// being in HDR. Moving the window to an SDR monitor changes the answer.
+  Future<bool> isHdrOutputSupported();
+
   /// Set the video frame rate for display refresh rate matching.
   ///
   /// On Android, this hints the system to adjust the display refresh rate

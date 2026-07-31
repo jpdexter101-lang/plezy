@@ -608,7 +608,21 @@ bool MpvPlayer::InitRenderContextForSurface(EGLDisplay display, EGLConfig config
       {MPV_RENDER_PARAM_API_TYPE, const_cast<char*>(MPV_RENDER_API_TYPE_OPENGL)},
       {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, &gl_init_params},
       {MPV_RENDER_PARAM_INVALID, nullptr},
+      {MPV_RENDER_PARAM_INVALID, nullptr},
   };
+
+  // The plane only exists on Wayland, and hwdec interop wants the display handle:
+  // without it VAAPI has to find a device by other means and can quietly end up
+  // on software decoding, on the path that exists for performance. The texture
+  // path passes the equivalent, so omitting it here was an asymmetry rather than
+  // a decision.
+#ifdef GDK_WINDOWING_WAYLAND
+  GdkDisplay* gdk_display = gdk_display_get_default();
+  if (GDK_IS_WAYLAND_DISPLAY(gdk_display)) {
+    params[2].type = MPV_RENDER_PARAM_WL_DISPLAY;
+    params[2].data = gdk_wayland_display_get_wl_display(gdk_display);
+  }
+#endif
 
   mpv_render_context* candidate_gl = nullptr;
   const int error = mpv_render_context_create(&candidate_gl, mpv_, params);
@@ -798,10 +812,9 @@ bool MpvPlayer::ReadSourceHdrMetadata(SourceHdrMetadata* out) {
   // outcome and leaves the field at zero.
   auto read = [this](const char* name, double* value) {
     double parsed = 0.0;
-    if (mpv_get_property(mpv_, name, MPV_FORMAT_DOUBLE, &parsed) < 0) return false;
-    if (!(parsed > 0.0)) return false;
+    if (mpv_get_property(mpv_, name, MPV_FORMAT_DOUBLE, &parsed) < 0) return;
+    if (!(parsed > 0.0)) return;
     *value = parsed;
-    return true;
   };
 
   // The colour space names, on the other hand, decide whether the plane may be
@@ -1246,10 +1259,6 @@ void MpvPlayer::RollbackPropertySequence(
     if (callback) callback(failure);
     return;
   }
-  // Awaited, not fired and forgotten. The caller releases the plane's present
-  // hold and lets the next queued request run the moment it is told, and a
-  // rollback still in flight then means a frame can reach the screen in a colour
-  // space that is neither the old one nor the new.
   const size_t index = undo_count - 1;
   const PropertyChange& change = (*changes)[index];
   SetPropertyAsync(

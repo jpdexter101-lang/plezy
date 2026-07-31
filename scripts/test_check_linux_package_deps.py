@@ -56,6 +56,68 @@ class LinuxPackageDepsGuardTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("dependency checks passed", result.stdout)
+        # Pins the walk's reach: gtk+-3.0, mpv, epoxy, glib-2.0, gio-2.0 and the
+        # three the video plane added. A drop here means the parser stopped seeing
+        # something rather than that a link was removed.
+        self.assertIn("(8 pkg-config links)", result.stdout)
+
+    # The three below are fail-open cases: each is legal CMake that a naive regex
+    # silently drops, leaving the guard to exit 0 while a library goes undeclared.
+    def test_a_comment_containing_a_paren_does_not_hide_the_rest_of_the_call(self) -> None:
+        cmake = self._mutate(
+            "runner/CMakeLists.txt",
+            "target_link_libraries(${BINARY_NAME} PRIVATE PkgConfig::EGL)",
+            "target_link_libraries(${BINARY_NAME} PRIVATE\n"
+            "  # host EGL (never bundled)\n"
+            "  PkgConfig::EGL\n"
+            ")",
+        )
+        packages = self._mutate("packaging/build-packages.py", '"libegl1",\n', "")
+
+        result = self._run(**{"runner/CMakeLists.txt": cmake, "packaging/build-packages.py": packages})
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("links egl but the deb package", result.stderr)
+
+    def test_a_generator_expression_still_names_its_target(self) -> None:
+        cmake = self._mutate(
+            "runner/CMakeLists.txt",
+            "PRIVATE PkgConfig::EGL)",
+            "PRIVATE $<LINK_ONLY:PkgConfig::EGL>)",
+        )
+        packages = self._mutate("packaging/build-packages.py", '"libegl1",\n', "")
+
+        result = self._run(**{"runner/CMakeLists.txt": cmake, "packaging/build-packages.py": packages})
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("links egl but the deb package", result.stderr)
+
+    def test_a_quoted_target_still_names_its_target(self) -> None:
+        cmake = self._mutate(
+            "runner/CMakeLists.txt",
+            "PRIVATE PkgConfig::EGL)",
+            'PRIVATE "PkgConfig::EGL")',
+        )
+        packages = self._mutate("packaging/build-packages.py", '"libegl1",\n', "")
+
+        result = self._run(**{"runner/CMakeLists.txt": cmake, "packaging/build-packages.py": packages})
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("links egl but the deb package", result.stderr)
+
+    def test_pkg_check_modules_options_may_precede_the_module_name(self) -> None:
+        # CMake takes its options in any order; reading REQUIRED as the module
+        # name fails closed but sends the reader hunting a package nobody ships.
+        cmake = self._mutate(
+            "runner/CMakeLists.txt",
+            "pkg_check_modules(EGL REQUIRED IMPORTED_TARGET egl)",
+            "pkg_check_modules(EGL IMPORTED_TARGET REQUIRED egl)",
+        )
+
+        result = self._run(**{"runner/CMakeLists.txt": cmake})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("REQUIRED", result.stderr)
 
     def test_the_dependency_lists_before_the_video_plane_are_rejected(self) -> None:
         # Verbatim the deb list as it stood while the runner already linked
@@ -185,15 +247,6 @@ class LinuxPackageDepsGuardTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("no longer excludes", result.stderr)
-
-    def test_an_unlinked_module_is_not_demanded(self) -> None:
-        # glib-2.0 and gio-2.0 are declared in flutter/CMakeLists.txt but are not
-        # linked into the runner by name, so the guard must not require them.
-        # It would otherwise grow into a list of everything pkg-config can see.
-        result = self._run()
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("(6 pkg-config links)", result.stdout)
 
 
 if __name__ == "__main__":
