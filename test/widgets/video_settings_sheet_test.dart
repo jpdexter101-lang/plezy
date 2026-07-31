@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -157,6 +158,50 @@ void main() {
     expect(tester.widget<Switch>(toggle).value, isFalse);
     expect(SettingsService.instance.read(SettingsService.enableHDR), isFalse);
   });
+
+  testWidgets('hides the HDR controls where the surface cannot carry HDR', (tester) async {
+    await _pumpSheet(tester);
+
+    // Scroll past where the HDR rows would sit. Without a following anchor the
+    // absence would also be satisfied by the ListView simply not having built
+    // that far yet, which is not the contract under test.
+    await tester.scrollUntilVisible(find.text('Auto-Play Next'), 500, scrollable: find.byType(Scrollable).first);
+
+    expect(find.text('HDR'), findsNothing);
+    expect(find.text('HDR Tone Mapping'), findsNothing);
+  });
+
+  testWidgets('the tone-mapping choice writes the mode before persisting it', (tester) async {
+    final writes = <(String, String)>[];
+    final player = _FakeSettingsPlayer(onSetProperty: (name, value) async => writes.add((name, value)));
+    await _pumpSheet(tester, player: player, supportsHdrControl: true, hosted: true);
+    await tester.scrollUntilVisible(find.text('HDR Tone Mapping'), 500, scrollable: find.byType(Scrollable).first);
+
+    await tester.tap(find.text('HDR Tone Mapping'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Player'));
+    await tester.pumpAndSettle();
+
+    expect(tester.takeException(), isNull);
+    expect(writes, [('hdr-tone-mapping', 'player')]);
+    expect(SettingsService.instance.read(SettingsService.hdrToneMapping), HdrToneMapping.player);
+  }, skip: !Platform.isLinux);
+
+  testWidgets('a refused tone-mapping write leaves the stored mode alone', (tester) async {
+    final player = _FakeSettingsPlayer(onSetProperty: (_, _) async => throw StateError('rejected'));
+    await _pumpSheet(tester, player: player, supportsHdrControl: true, hosted: true);
+    await tester.scrollUntilVisible(find.text('HDR Tone Mapping'), 500, scrollable: find.byType(Scrollable).first);
+
+    await tester.tap(find.text('HDR Tone Mapping'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Player'));
+    await tester.pumpAndSettle();
+
+    // mpv is asked before the setting is written, precisely so a refusal
+    // cannot leave the stored mode claiming one the player never entered.
+    expect(tester.takeException(), isNull);
+    expect(SettingsService.instance.read(SettingsService.hdrToneMapping), HdrToneMapping.compositor);
+  }, skip: !Platform.isLinux);
 }
 
 Future<void> _pumpSheet(
@@ -164,27 +209,29 @@ Future<void> _pumpSheet(
   bool canControl = false,
   Player? player,
   bool supportsHdrControl = false,
+  // Option views that dismiss themselves on selection reach
+  // OverlaySheetController.of(), which asserts without a host above it.
+  bool hosted = false,
 }) async {
+  final sheet = SizedBox(
+    width: 900,
+    height: 700,
+    child: VideoSettingsSheet(
+      player: player ?? _FakeSettingsPlayer(),
+      supportsHdrControl: supportsHdrControl,
+      trackControlsState: TrackControlsState(canControl: canControl),
+    ),
+  );
   await tester.pumpWidget(
     MaterialApp(
       theme: ThemeData(extensions: const [testMonoTokensAnimated]),
-      home: Scaffold(
-        body: SizedBox(
-          width: 900,
-          height: 700,
-          child: VideoSettingsSheet(
-            player: player ?? _FakeSettingsPlayer(),
-            supportsHdrControl: supportsHdrControl,
-            trackControlsState: TrackControlsState(canControl: canControl),
-          ),
-        ),
-      ),
+      home: Scaffold(body: hosted ? OverlaySheetHost(child: sheet) : sheet),
     ),
   );
   await tester.pumpAndSettle();
 }
 
-Future<void> _pumpHostedSheet(WidgetTester tester, Player player) async {
+Future<void> _pumpHostedSheet(WidgetTester tester, Player player, {bool? supportsHdrControl}) async {
   await tester.pumpWidget(
     MaterialApp(
       theme: ThemeData(extensions: const [testMonoTokensAnimated]),
@@ -196,6 +243,7 @@ Future<void> _pumpHostedSheet(WidgetTester tester, Player player) async {
                 OverlaySheetController.of(context).show<void>(
                   builder: (_) => VideoSettingsSheet(
                     player: player,
+                    supportsHdrControl: supportsHdrControl,
                     trackControlsState: const TrackControlsState(canControl: true),
                   ),
                 ),
