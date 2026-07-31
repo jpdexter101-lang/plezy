@@ -99,7 +99,7 @@ Package managers:
 - Settings import/export
 - Localized in English plus 14 translations
 
-[^1]: Not available on Linux.
+[^1]: Dolby Vision is not available on Linux, where HDR needs a Wayland compositor with colour management.
 [^2]: Plex only.
 [^3]: Not available on iOS or tvOS.
 [^4]: Android, iOS, and macOS.
