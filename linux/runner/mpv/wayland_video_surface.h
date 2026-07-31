@@ -22,6 +22,9 @@ struct wp_color_management_surface_feedback_v1;
 struct wp_color_manager_v1;
 struct wp_image_description_v1;
 struct wp_image_description_info_v1;
+// The listener aggregate, not just the interface: InfoListener() returns a
+// reference to one, so the name has to be visible here too.
+struct wp_image_description_info_v1_listener;
 
 namespace mpv {
 

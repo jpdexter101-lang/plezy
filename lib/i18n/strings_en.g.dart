@@ -3955,9 +3955,6 @@ class Translations$videoSettings$en {
 	/// en: 'HDR Tone Mapping'
 	String get hdrToneMapping => 'HDR Tone Mapping';
 
-	/// en: 'Choose which side reduces HDR content to what your display can show.'
-	String get hdrToneMappingDescription => 'Choose which side reduces HDR content to what your display can show.';
-
 	/// en: 'Compositor'
 	String get hdrToneMappingCompositor => 'Compositor';
 
@@ -7392,7 +7389,6 @@ extension on Translations {
 			'videoSettings.subtitleSync' => 'Subtitle Sync',
 			'videoSettings.hdr' => 'HDR',
 			'videoSettings.hdrToneMapping' => 'HDR Tone Mapping',
-			'videoSettings.hdrToneMappingDescription' => 'Choose which side reduces HDR content to what your display can show.',
 			'videoSettings.hdrToneMappingCompositor' => 'Compositor',
 			'videoSettings.hdrToneMappingCompositorDescription' => 'Pass the source\'s HDR metadata through and let the desktop compositor map it.',
 			'videoSettings.hdrToneMappingPlayer' => 'Player',
@@ -7483,9 +7479,9 @@ extension on Translations {
 			'metadataEdit.uploadFile' => 'Upload File',
 			'metadataEdit.enterImageUrl' => 'Enter image URL',
 			'metadataEdit.imageUrl' => 'Image URL',
+			'metadataEdit.metadataUpdated' => 'Metadata updated',
 			_ => null,
 		} ?? switch (path) {
-			'metadataEdit.metadataUpdated' => 'Metadata updated',
 			'metadataEdit.metadataUpdateFailed' => 'Failed to update metadata',
 			'metadataEdit.artworkUpdated' => 'Artwork updated',
 			'metadataEdit.artworkUpdateFailed' => 'Failed to update artwork',

@@ -1586,7 +1586,6 @@
     "subtitleSync": "Subtitle Sync",
     "hdr": "HDR",
     "hdrToneMapping": "HDR Tone Mapping",
-    "hdrToneMappingDescription": "Choose which side reduces HDR content to what your display can show.",
     "hdrToneMappingCompositor": "Compositor",
     "hdrToneMappingCompositorDescription": "Pass the source's HDR metadata through and let the desktop compositor map it.",
     "hdrToneMappingPlayer": "Player",
