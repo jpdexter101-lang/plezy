@@ -1386,6 +1386,12 @@ void MpvPlayer::RunPendingHdrOutput() {
   const bool tone_map_here = request->peak_nits >= 10 && request->peak_nits <= kPqMaxLuminanceNits;
   const std::string peak = tone_map_here ? std::to_string(request->peak_nits) : std::string("auto");
 
+  // The three values that decide who tone-maps and against what, none of which
+  // is visible on screen: two very different curves both look like working
+  // video. Logged next to the plane's own decisions so a capture can be matched
+  // to the state that produced it.
+  g_message("MPV: output colour target peak=%s prim=%s trc=%s", peak.c_str(), primaries, curve);
+
   auto changes = std::make_shared<std::vector<PropertyChange>>();
   changes->push_back({"target-peak", peak, applied_target_peak_});
   changes->push_back({"target-prim", primaries, applied_target_prim_});
