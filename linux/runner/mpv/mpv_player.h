@@ -389,6 +389,10 @@ class MpvPlayer {
   std::string applied_target_peak_ = "auto";
   std::string applied_target_prim_ = "auto";
   std::string applied_target_trc_ = "auto";
+  // Carried with the output description rather than set once globally: it selects
+  // the tone-map operator, but also drives gamut reduction, so it has to be
+  // withdrawn again whenever no tone mapping is being done.
+  std::string applied_tone_mapping_ = "auto";
   // What the unwinding of a refused sequence achieved. Reset to kRestored before
   // each sequence; the escalation path moves it to kForcedSdr or kUnknown, and
   // RunPendingHdrOutput reports whichever applies.

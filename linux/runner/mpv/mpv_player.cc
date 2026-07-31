@@ -336,16 +336,16 @@ bool MpvPlayer::Initialize() {
   mpv_set_option_string(mpv_, "audio-fallback-to-null", "yes");
 
   if (!audio_only_) {
-    // Both of these are what the player-side tone-mapping path needs, and both
-    // are inert without it, so neither is toggled per mode.
+    // hdr-compute-peak is nested under the same predicate as the tone-map pass -
+    // it runs exactly when the source's declared peak exceeds target-peak - so it
+    // costs nothing while the compositor owns tone mapping and gives
+    // content-adaptive peak detection once we own it.
     //
-    // tone-mapping=auto resolves to BT.2390 in the legacy renderer, but only
-    // when a tone-map pass actually runs — which happens exactly when the
-    // source's declared peak exceeds target-peak. hdr-compute-peak=auto is
-    // likewise nested under that same predicate, so it costs nothing while the
-    // compositor owns tone mapping and gives content-adaptive peak detection
-    // once we own it.
-    mpv_set_option_string(mpv_, "tone-mapping", "auto");
+    // `tone-mapping` is deliberately *not* set here. It selects the operator for
+    // the tone-map pass, but in this mpv it also drives gamut reduction, so a
+    // global value would reach wide-gamut SDR content that has no tone mapping to
+    // do. It is applied and withdrawn with the rest of the output description in
+    // RunPendingHdrOutput instead.
     mpv_set_option_string(mpv_, "hdr-compute-peak", "auto");
     // Declared by vo_gpu_next only, so inert for the render API. Kept because
     // the same code serves platforms whose players do read it.
@@ -1280,13 +1280,14 @@ void MpvPlayer::RollbackPropertySequence(
 }
 
 void MpvPlayer::ForceSdrOutput(size_t index, int failure, StatusCallback callback) {
-  // Reverse of the apply order, so the transfer function stops asking for HDR
-  // before the primaries and peak follow it back.
-  static const char* const kResetOrder[] = {"target-trc", "target-prim", "target-peak"};
+  // Same order the apply path uses: the transfer function stops asking for HDR
+  // before the primaries, operator and peak follow it back.
+  static const char* const kResetOrder[] = {"target-trc", "target-prim", "tone-mapping", "target-peak"};
   constexpr size_t kResetCount = sizeof(kResetOrder) / sizeof(kResetOrder[0]);
   if (index >= kResetCount) {
     applied_target_trc_ = "auto";
     applied_target_prim_ = "auto";
+    applied_tone_mapping_ = "auto";
     applied_target_peak_ = "auto";
     // mpv is SDR now, not back where it started, so any HDR description the
     // caller has already committed is a lie about these pixels.
@@ -1394,28 +1395,27 @@ void MpvPlayer::RunPendingHdrOutput() {
                           ? "hlg"
                           : (request->transfer == SourceTransfer::kPq ? "pq" : (tone_map_here ? "srgb" : "auto"));
 
-  // The three values that decide who tone-maps and against what, none of which
-  // is visible on screen: two very different curves both look like working
-  // video. Logged next to the plane's own decisions so a capture can be matched
-  // to the state that produced it.
-  g_message("MPV: output colour target peak=%s prim=%s trc=%s", peak.c_str(), primaries, curve);
+  // The operator only matters while a tone-map pass runs, and it must go back to
+  // auto when one does not: in this mpv it also drives gamut reduction, so
+  // leaving mobius in place would reach wide-gamut SDR content that has nothing
+  // to tone-map. See InitMpv for why it is not a global option, and the commit
+  // that introduced it for the measurements behind the choice.
+  const char* operator_name = tone_map_here ? "mobius" : "auto";
 
-  // Dependencies first, peak last, matching the order kResetOrder already uses.
-  //
-  // What is established: with peak=200 and trc=srgb both applied, but peak
-  // written first while trc was still `auto`, the shadows moved (1 nit 22.3 ->
-  // 15.1) and the highlights did not - 400/700/1000 nits stayed within five code
-  // values. So the transfer took effect and no tone-map pass ran.
-  //
-  // The hypothesis for that, not yet confirmed: libmpv settles whether a
-  // tone-map pass is needed when the peak changes, and at that instant the
-  // target was still unknown, so it concluded there was nothing to map into. If
-  // reordering does not change the measured curve then this is wrong and the
-  // cause lies elsewhere - most likely the 0.40-vs-0.41 or GLES-vs-Vulkan gap
-  // against which the reference curve was taken.
+  // The values that decide who tone-maps and against what, none of which is
+  // visible on screen: two very different curves both look like working video.
+  // Logged next to the plane's own decisions so a capture can be matched to the
+  // state that produced it.
+  g_message("MPV: output colour target peak=%s prim=%s trc=%s tone-mapping=%s", peak.c_str(), primaries, curve,
+            operator_name);
+
+  // Dependencies first, peak last, matching the order kResetOrder uses. The peak
+  // is what decides whether a tone-map pass runs at all, so everything that pass
+  // depends on is in place before it is named.
   auto changes = std::make_shared<std::vector<PropertyChange>>();
   changes->push_back({"target-trc", curve, applied_target_trc_});
   changes->push_back({"target-prim", primaries, applied_target_prim_});
+  changes->push_back({"tone-mapping", operator_name, applied_tone_mapping_});
   changes->push_back({"target-peak", peak, applied_target_peak_});
   ApplyPropertySequence(changes, 0, [this, changes, request](int error) {
     const bool ok = plezy::mpv_common::SetPropertyStatusSucceeded(error);
@@ -1432,6 +1432,8 @@ void MpvPlayer::RunPendingHdrOutput() {
           applied_target_prim_ = change.value;
         } else if (change.name == "target-trc") {
           applied_target_trc_ = change.value;
+        } else if (change.name == "tone-mapping") {
+          applied_tone_mapping_ = change.value;
         }
       }
     }
