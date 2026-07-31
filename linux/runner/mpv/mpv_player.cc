@@ -1300,7 +1300,7 @@ void MpvPlayer::ForceSdrOutput(size_t index, int failure, StatusCallback callbac
       ForceSdrOutput(index + 1, failure, std::move(cb));
       return;
     }
-    // `auto` is valid for all three, so this failing means mpv is
+    // `auto` is valid for every one of them, so this failing means mpv is
     // no longer taking orders at all - usually because it is being
     // disposed. Either way what it emits is now unknowable, and the
     // caller must stop presenting the plane rather than guess.
@@ -1361,36 +1361,32 @@ void MpvPlayer::RunPendingHdrOutput() {
   // ForceSdrOutput moves this on if it cannot manage one.
   hdr_unwind_result_ = HdrOutputResult::kRestored;
 
-  // Three properties describe one output colour space, so they are applied as a
+  // Four properties describe one output colour space, so they are applied as a
   // unit. A plane whose primaries moved to BT.2020 while its transfer function
   // stayed on gamma is neither SDR nor HDR, and the caller describes the surface
   // to the compositor on success — a silently half-applied set would have the
   // compositor told one thing and shown another.
   //
-  // target-peak is what mpv maps to, and it matters in both directions.
+  // target-peak is what mpv maps to. Under PQ, left on auto it resolves to the
+  // format's nominal 10000 nits, so the renderer never tone-maps and the
+  // compositor owns the decision. Set to the display's real peak, mpv tone-maps
+  // to it and the caller declares that same peak, leaving the compositor nothing
+  // to do.
   //
-  // Under PQ, left on auto it resolves to the format's nominal 10000 nits, so the
-  // renderer never tone-maps and the compositor owns the decision. Set to the
-  // display's real peak, mpv tone-maps to it with BT.2390 and the caller declares
-  // that same peak, leaving the compositor nothing to do.
-  //
-  // On the SDR fallback it is just as load-bearing, which is easy to miss because
-  // the curve and gamut stay on auto there. The render API has no window, so auto
-  // cannot resolve to a display: mpv encodes against a nominal reference white and
-  // clips above it rather than tone-mapping. Hence no `enabled` in the condition
-  // below — an SDR peak is a real instruction, not a leftover from an HDR request.
+  // On the SDR fallback the peak and curve are named for accuracy, not to make
+  // tone mapping happen: mpv 0.40 already resolves target-peak=auto to 203 nits
+  // and target-trc=auto to gamma 2.2 for an SDR curve, and measurement confirmed
+  // naming them changed the shadows but not the highlights. What they buy is the
+  // surface's real terms instead of assumed ones - the compositor's own reference
+  // white, and sRGB, which is what an undescribed Wayland surface is and what
+  // this compositor's preferred description for the output says. Hence no
+  // `enabled` in the peak condition below: an SDR peak is a real instruction, not
+  // a leftover from an HDR request.
   const bool enabled = request->transfer != SourceTransfer::kSdr;
   const char* primaries = enabled ? "bt.2020" : "auto";
   // The option is an integer in [10, 10000]; anything outside means "auto".
   const bool tone_map_here = request->peak_nits >= 10 && request->peak_nits <= kPqMaxLuminanceNits;
   const std::string peak = tone_map_here ? std::to_string(request->peak_nits) : std::string("auto");
-  // Naming the peak is not sufficient on its own: measured with peak=200 and the
-  // curve left on auto, the output was byte-for-byte what auto alone produced.
-  // mpv has to know the transfer it is mapping *into* before a peak means
-  // anything, and on the render API it cannot discover one - so on the fallback
-  // it is named here. sRGB is what the surface is: an undescribed Wayland surface
-  // is sRGB by convention, and this compositor's preferred description for the
-  // output agrees.
   const char* curve = request->transfer == SourceTransfer::kHlg
                           ? "hlg"
                           : (request->transfer == SourceTransfer::kPq ? "pq" : (tone_map_here ? "srgb" : "auto"));

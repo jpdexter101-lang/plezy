@@ -184,9 +184,9 @@ class MpvPlayer {
   /// assumed: HLG content described to the compositor as HLG must also be
   /// *encoded* as HLG. SourceTransfer::kSdr restores the tone-mapped output.
   ///
-  /// All three properties are applied as a unit, and on failure the ones that
-  /// landed are unwound — awaited, not fired and forgotten — so that by the time
-  /// the callback runs mpv is in exactly the state the result names.
+  /// The output-description properties are applied as a unit, and on failure the
+  /// ones that landed are unwound — awaited, not fired and forgotten — so that by
+  /// the time the callback runs mpv is in exactly the state the result names.
   ///
   /// `target_peak_nits` decides who tone-maps. Zero (or anything outside mpv's
   /// 10..10000 range) leaves `target-peak` on auto, which under PQ resolves to
@@ -355,7 +355,7 @@ class MpvPlayer {
   void RollbackPropertySequence(
       std::shared_ptr<std::vector<PropertyChange>> changes, size_t undo_count, int failure, StatusCallback callback);
 
-  /// Drives all three target properties to `auto` — the one state that is always
+  /// Drives every target property to `auto` — the one state that is always
   /// describable and always accepts its value — after an unwinding step itself
   /// failed. Reports `failure`, the original refusal, once mpv is settled.
   void ForceSdrOutput(size_t index, int failure, StatusCallback callback);

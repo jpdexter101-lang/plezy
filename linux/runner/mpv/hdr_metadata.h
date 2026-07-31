@@ -288,13 +288,12 @@ inline uint32_t UsableTargetPeak(uint32_t nits, uint32_t volume_max) {
 // and the file. Any one of them failing means falling back to mpv's ordinary
 // tone-mapped SDR output, which is always safe.
 //
-// Both branches have to tell mpv what it is mapping to, for the same reason and
-// from different fields. The render API has no window, so mpv cannot discover
-// the display the way a windowed `mpv` does: left on auto it does not tone-map
-// at all, it encodes against a nominal reference white and clips everything
-// above it. Measured on a 1000-nit source that put 400, 700 and 1000 nits within
-// six code values of each other, while the same renderer given a real target
-// still separated them.
+// Both branches tell mpv what it is mapping to, from different fields. Left on
+// auto mpv does pick defaults for an SDR curve - 203 nits and gamma 2.2 in this
+// version - so this is about naming the output's real terms rather than assumed
+// ones, and measurably so at the bottom of the range. It is not what makes tone
+// mapping happen: that turned out to be the operator, and naming the peak alone
+// left the highlights exactly where they were.
 //
 // Which field is right depends on what the plane will carry. Described, the
 // output is in HDR and its peak is reachable. Undescribed, the buffer is an
