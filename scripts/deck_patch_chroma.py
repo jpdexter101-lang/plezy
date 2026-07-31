@@ -143,9 +143,14 @@ def main() -> int:
         name = p.rsplit("/", 1)[-1].replace(".png", "")
         print(f"  {name:<22} {tot / n:9.4f} {worst[p][0]:9.4f} {dy / n * 100:+8.1f}%   {loc}")
 
-    print("\n  dxy is distance in CIE xy: ~0.002 is near the visible-difference threshold,")
-    print("  0.01+ is an obvious hue/saturation shift. dY% is relative luminance on the")
-    print("  same pixels, so a large dY with a small dxy means brightness moved, not hue.")
+    print("\n  dxy is Euclidean distance in CIE xy, which is NOT perceptually uniform: the same")
+    print("  number means different things in different regions of the diagram, so there is no")
+    print("  universal just-noticeable threshold to compare it against. Use it only to rank")
+    print("  captures of the same frame against each other - a value an order of magnitude")
+    print("  larger than its peers is a real difference in mapping, and the screenshots say")
+    print("  whether it matters. dY% is the mean relative change in linear luminance over the")
+    print("  pixels that survived filtering, not a whole-image brightness figure; a large dY")
+    print("  beside a small dxy means brightness moved rather than hue.")
     return 0
 
 
