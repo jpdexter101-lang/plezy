@@ -290,10 +290,10 @@ inline uint32_t UsableTargetPeak(uint32_t nits, uint32_t volume_max) {
 //
 // Both branches tell mpv what it is mapping to, from different fields. Left on
 // auto mpv does pick defaults for an SDR curve - 203 nits and gamma 2.2 in this
-// version - so this is about naming the output's real terms rather than assumed
-// ones, and measurably so at the bottom of the range. It is not what makes tone
-// mapping happen: that turned out to be the operator, and naming the peak alone
-// left the highlights exactly where they were.
+// version - and does tone-map against them, so this is about naming the output's
+// real terms rather than assumed ones, measurably so at the bottom of the range.
+// It is not what fixes the roll-off; that is the operator, and naming the peak
+// alone left the highlights exactly where they were.
 //
 // Which field is right depends on what the plane will carry. Described, the
 // output is in HDR and its peak is reachable. Undescribed, the buffer is an
